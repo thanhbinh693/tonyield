@@ -354,26 +354,55 @@ export function useApp() {
     if (amount < minWd)        { showToast(`Min: ${minWd} TON`,'err'); return false }
     if (amount > user.balance) { showToast('Insufficient balance','err'); return false }
     const destWallet = (walletAddress||'').trim()
-    if (!destWallet) { showToast('Wallet not connected.','err'); return false }
-    if (!/^[UEk0][Qq][A-Za-z0-9_-]+=?$/.test(destWallet)) {
+    if (!destWallet) { showToast('Connect your TON wallet first','err'); return false }
+    if (!/^[EUk0][Qg][A-Za-z0-9+/_-]{46}$/.test(destWallet)) {
       showToast('Invalid wallet address format.','err'); return false
     }
-    const now = Date.now()
-    const txId = 'tx-'+now
+    const now  = Date.now()
+    const txId = 'tx-' + now
     const newBal = Math.max(0, user.balance - amount)
+
+    // Optimistic UI update — show result immediately before API responds
+    const prevBalance    = user.balance
+    const prevWalletAddr = user.walletAddr
+    setUser(p => ({ ...p, balance: newBal, walletAddr: destWallet }))
+    setTransactions(p => [{
+      id: txId, type: 'withdraw',
+      label: `Withdrawal → ${destWallet.slice(0, 8)}...`,
+      date: 'Just now', amount: -amount, status: 'processing',
+      createdAt: now, toWallet: destWallet, userId: tid,
+    }, ...p])
+
     try {
-      // DB FIRST
-      const { error:syncErr } = await supabase.from('users').upsert({ id:Number(tid), balance:newBal, wallet_addr:destWallet, updated_at:new Date().toISOString() }, { onConflict:'id' })
-      if (syncErr) throw syncErr
-      const { error } = await supabase.from('transactions').insert({ id:txId, user_id:Number(tid), type:'withdraw', label:`Withdrawal → ${destWallet.slice(0,8)}...`, amount, status:'pending', to_wallet:destWallet, created_at:now })
-      if (error) throw error
-      // STATE AFTER
-      setUser(p => ({ ...p, balance:newBal, walletAddr:destWallet }))
-      setTransactions(p => [{ id:txId, type:'withdraw', label:`Withdrawal → ${destWallet.slice(0,8)}...`, date:'Just now', amount:-amount, status:'pending', createdAt:now, toWallet:destWallet, userId:tid }, ...p])
-      showToast('Withdrawal submitted! Processing... ⏳','ok')
+      const initData = window.Telegram?.WebApp?.initData || ''
+      const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3001/api'
+      const res = await fetch(`${API_BASE}/withdraw`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ initData, userId: tid, amount, destWallet }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        // Rollback optimistic update
+        setUser(p => ({ ...p, balance: prevBalance, walletAddr: prevWalletAddr }))
+        setTransactions(p => p.filter(t => t.id !== txId))
+        showToast(data?.error || 'Failed to submit withdrawal.', 'err')
+        return false
+      }
+      // Update balance from backend (authoritative) and mark tx as pending
+      setUser(p => ({ ...p, balance: data.newBalance ?? newBal, walletAddr: destWallet }))
+      setTransactions(p => p.map(t => t.id === txId ? { ...t, status: 'pending' } : t))
+      showToast('Withdrawal submitted! Processing... ⏳', 'ok')
       return true
-    } catch(e) { console.error('[withdraw]',e); showToast('Failed to submit withdrawal.','err'); return false }
-  }, [config.minWithdraw, user.balance, tid, showToast])
+    } catch(e) {
+      console.error('[withdraw]', e)
+      // Rollback optimistic update
+      setUser(p => ({ ...p, balance: prevBalance, walletAddr: prevWalletAddr }))
+      setTransactions(p => p.filter(t => t.id !== txId))
+      showToast('Failed to submit withdrawal.', 'err')
+      return false
+    }
+  }, [config.minWithdraw, user.balance, user.walletAddr, tid, showToast])
 
   const activateInvestment = useCallback(async (invId) => {
     const inv = investments.find(i => i.id===invId)

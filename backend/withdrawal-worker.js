@@ -24,10 +24,11 @@
 
 import 'dotenv/config'
 import { createClient }   from '@supabase/supabase-js'
-// ✅ FIX: Import Address from @ton/core — was missing, caused all withdrawals to silently fail
 import { TonClient, WalletContractV4, internal } from '@ton/ton'
 import { mnemonicToWalletKey } from '@ton/crypto'
 import { Address } from '@ton/core'
+import express from 'express'
+import crypto  from 'crypto'
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 
@@ -37,6 +38,8 @@ const ADMIN_MNEMONIC       = process.env.ADMIN_MNEMONIC
 const POLL_INTERVAL_MS     = Number(process.env.POLL_INTERVAL_MS) || 15_000
 const TON_NETWORK          = process.env.TON_NETWORK || 'mainnet'
 const TON_API_KEY          = process.env.TON_API_KEY || ''
+const BOT_TOKEN            = process.env.BOT_TOKEN   || ''
+const PORT                 = Number(process.env.PORT) || 3001
 const NETWORK_FEE          = 0.015
 const CONFIRM_TIMEOUT_MS   = 90_000
 const MAX_BATCH_SIZE       = 10
@@ -159,7 +162,131 @@ async function markFailed(txId, reason) {
   }
 }
 
-// ─── SEND TON ────────────────────────────────────────────────────────────────
+// ─── TELEGRAM initData VERIFICATION ─────────────────────────────────────────
+
+/**
+ * Verify Telegram WebApp initData and resolve userId.
+ * Returns { userId, authorized }.
+ * If BOT_TOKEN is not set, falls back to trusting bodyUserId (dev mode).
+ */
+function resolveUserId(initData, bodyUserId) {
+  if (!BOT_TOKEN) {
+    // Dev/test mode: no bot token configured, trust client-supplied userId
+    console.warn('[Auth] BOT_TOKEN not set — skipping initData verification (dev mode)')
+    return { userId: bodyUserId, authorized: !!bodyUserId }
+  }
+  if (!initData) return { userId: null, authorized: false }
+  try {
+    const params  = new URLSearchParams(initData)
+    const hash    = params.get('hash')
+    if (!hash) return { userId: null, authorized: false }
+    params.delete('hash')
+    const dataCheckString = [...params.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([k, v]) => `${k}=${v}`)
+      .join('\n')
+    const secretKey = crypto.createHmac('sha256', 'WebAppData').update(BOT_TOKEN).digest()
+    const computed  = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex')
+    if (computed !== hash) return { userId: null, authorized: false }
+    const userStr = params.get('user')
+    const user    = userStr ? JSON.parse(userStr) : null
+    return { userId: user?.id ? String(user.id) : null, authorized: !!user?.id }
+  } catch(e) {
+    console.error('[resolveUserId]', e.message)
+    return { userId: null, authorized: false }
+  }
+}
+
+// ─── EXPRESS API ─────────────────────────────────────────────────────────────
+
+function startApiServer() {
+  const app = express()
+  app.use(express.json())
+
+  // CORS for Telegram WebApp / local dev
+  app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
+    if (req.method === 'OPTIONS') return res.sendStatus(204)
+    next()
+  })
+
+  /**
+   * POST /api/withdraw
+   * Body: { initData, userId, amount, destWallet }
+   */
+  app.post('/api/withdraw', async (req, res) => {
+    const { initData, userId: bodyUserId, amount: rawAmount, destWallet: rawWallet } = req.body
+
+    // 1. Authenticate via Telegram initData
+    const { userId, authorized } = resolveUserId(initData, bodyUserId)
+    if (!authorized) return res.status(401).json({ error: 'Unauthorized' })
+
+    // 2. Validate amount
+    const amt = Number(rawAmount)
+    if (!amt || amt < 0.01) return res.status(400).json({ error: 'Invalid amount' })
+
+    // 3. Parse & validate destination wallet
+    const toWallet = parseToFriendly(rawWallet)
+    if (!toWallet) return res.status(400).json({ error: 'Invalid destination wallet format' })
+
+    try {
+      // 4. Check user exists and is not banned
+      const { data: userRow, error: uErr } = await supabase
+        .from('users').select('balance, wallet_addr, status').eq('id', Number(userId)).maybeSingle()
+      if (uErr || !userRow) return res.status(404).json({ error: 'User not found' })
+      if (userRow.status === 'banned') return res.status(403).json({ error: 'User is banned' })
+
+      // 5. Check balance (server-authoritative — do NOT trust client)
+      if (Number(userRow.balance) < amt) return res.status(400).json({ error: 'Insufficient balance' })
+
+      // 6. Deduct balance and save wallet address
+      const newBalance = Math.max(0, Number(userRow.balance) - amt)
+      const { error: updateErr } = await supabase.from('users').update({
+        balance:     newBalance,
+        wallet_addr: toWallet,
+        updated_at:  new Date().toISOString(),
+      }).eq('id', Number(userId))
+      if (updateErr) return res.status(500).json({ error: 'Failed to update balance' })
+
+      // 7. Insert transaction record (status: pending)
+      const txId = 'tx-' + Date.now()
+      const now  = Date.now()
+      const { error: insErr } = await supabase.from('transactions').insert({
+        id:         txId,
+        user_id:    Number(userId),
+        type:       'withdraw',
+        label:      `Withdrawal → ${toWallet.slice(0, 8)}...`,
+        amount:     amt,
+        status:     'pending',
+        to_wallet:  toWallet,
+        created_at: now,
+      })
+      if (insErr) {
+        // Rollback balance deduction
+        await supabase.from('users').update({ balance: userRow.balance }).eq('id', Number(userId))
+        return res.status(500).json({ error: 'Failed to create transaction' })
+      }
+
+      // 8. Respond immediately, then trigger worker
+      res.json({ success: true, txId, newBalance })
+
+      // Fire-and-forget: process this withdrawal now without blocking response
+      processOnce().catch(err => console.error('[API Instant Process Error]', err))
+
+    } catch(e) {
+      console.error('[POST /api/withdraw]', e)
+      res.status(500).json({ error: 'Internal server error' })
+    }
+  })
+
+  app.listen(PORT, () => {
+    console.log(`[API] Listening on port ${PORT}`)
+  })
+}
+
+
 
 async function sendTon(toAddress, amountTon, txId) {
   const nanotons = BigInt(Math.round(amountTon * 1e9))
@@ -254,6 +381,7 @@ async function startWorker() {
   console.log(`[Worker] TonYield Withdrawal Worker v2`)
   console.log(`[Network]  ${TON_NETWORK}`)
   console.log(`[Interval] ${POLL_INTERVAL_MS}ms`)
+  startApiServer()
   await initAdminWallet()
   while (true) {
     try { await processOnce() } catch(e) { console.error('[Worker Error]', e) }
