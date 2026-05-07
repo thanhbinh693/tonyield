@@ -99,7 +99,7 @@ export async function saveUserBundle(telegramId, bundle) {
 export async function registerUser(telegramId, referredByCode = '') {
   const id = Number(telegramId)
   if (!id) return
-  const referral_code = `TON-${String(id).slice(-6)}`
+  const referral_code = String(id).slice(-6)
   // Only set referred_by if not already registered (ignoreDuplicates won't overwrite)
   const row = { id, referral_code }
   if (referredByCode) row.referred_by = referredByCode
@@ -303,7 +303,7 @@ export async function getAllUsersData() {
         investments: userInvs,
         transactions: userTxs,
         referral: {
-          code:       u.referral_code || `TON-${String(uid).slice(-6)}`,
+          code:       u.referral_code || String(uid).slice(-6),
           friends:    u.referral_friends || 0,
           commission: u.referral_commission || 0,
         },

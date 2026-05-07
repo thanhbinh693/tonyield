@@ -44,7 +44,7 @@ function DisconnectModal({ walletAddr, onClose, onConfirm }) {
 }
 
 // ─── ProfilePage ──────────────────────────────────────────────────────────────
-export default function ProfilePage({ user, referral, config, showToast, setIsAdmin, isAdmin, walletConnected, disconnectWallet }) {
+export default function ProfilePage({ user, referral, config, showToast, setIsAdmin, isAdmin, walletConnected, disconnectWallet, connectWallet }) {
   const [showDisconnect, setShowDisconnect] = useState(false)
 
   const refRate = config?.referralRate ?? 5
@@ -52,7 +52,7 @@ export default function ProfilePage({ user, referral, config, showToast, setIsAd
   const copyRef = () => {
     const link = referral.code?.startsWith('http')
       ? referral.code
-      : `https://t.me/TONYieldBot?start=${referral.code}`
+      : `https://t.me/TONYieldBot?start=ref_${referral.code}`
     navigator.clipboard?.writeText(link).catch(() => {})
     showToast('Referral link copied!')
   }
@@ -65,7 +65,9 @@ export default function ProfilePage({ user, referral, config, showToast, setIsAd
   const menu = [
     { icon: '◎', color: 'gold',  label: 'TON Wallet',        sub: user?.walletAddr ? (user.walletAddr.slice(0,8)+'...') : 'Not connected', action: () => showToast('Wallet settings') },
     { icon: '⊙', color: 'green', label: 'Support',           sub: '24/7 live chat',     action: () => showToast('Support opened') },
-    { icon: '⊗', color: 'red',   label: 'Disconnect Wallet', sub: 'Unlink TON Connect', danger: true, action: () => setShowDisconnect(true) },
+    walletConnected
+      ? { icon: '⊗', color: 'red',   label: 'Disconnect Wallet', sub: 'Unlink TON Connect', danger: true, action: () => setShowDisconnect(true) }
+      : { icon: '◎', color: 'blue',  label: 'Connect Wallet',    sub: 'Link your TON wallet', action: () => connectWallet && connectWallet() },
   ]
 
   return (

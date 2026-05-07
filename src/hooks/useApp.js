@@ -55,7 +55,7 @@ function mkDefaultUser(tgUser) {
   }
 }
 function mkDefaultRef(tid) {
-  return { code: `TON-${String(tid).slice(-6)}`, friends: 0, commission: 0 }
+  return { code: String(tid).slice(-6), friends: 0, commission: 0 }
 }
 const DEFAULT_CONFIG = {
   minWithdraw: MIN_WITHDRAW,
@@ -157,7 +157,7 @@ export function useApp() {
     const bot = config.botUsername?.trim()
     const code = bot
       ? `https://t.me/${bot}?start=ref_${String(tid).slice(-6)}`
-      : `TON-${String(tid).slice(-6)}`
+      : `ref_${String(tid).slice(-6)}`
     setReferral(p => ({ ...p, code }))
   }, [config.botUsername, tid])
 
@@ -574,13 +574,24 @@ export function useApp() {
   }, [tid, showToast])
 
   const adminUpdateUser = useCallback(async (userId, updates) => {
-    const all = await getAllUsersData()
-    const entry = all.find(x => Number(x.id)===Number(userId))
-    const bundle = entry?.bundle || {}
-    bundle.user = { ...(bundle.user||{}), ...updates }
-    await saveUserBundle(userId, bundle)
-    if (Number(userId)===Number(tid)) setUser(p => ({ ...p, ...updates }))
-    showToast('User updated!','ok')
+    try {
+      const all = await getAllUsersData()
+      const entry = all.find(x => Number(x.id)===Number(userId))
+      if (!entry) { showToast('User not found', 'err'); return }
+      // Preserve full bundle (investments, transactions, referral) — only patch user fields
+      const fullBundle = {
+        investments: entry.bundle.investments || [],
+        transactions: entry.bundle.transactions || [],
+        referral: entry.bundle.referral || {},
+        user: { ...(entry.bundle.user || {}), ...updates },
+      }
+      await saveUserBundle(userId, fullBundle)
+      if (Number(userId)===Number(tid)) setUser(p => ({ ...p, ...updates }))
+      showToast('User updated!','ok')
+    } catch(e) {
+      console.error('[adminUpdateUser]', e)
+      showToast('Failed to update user', 'err')
+    }
   }, [tid, showToast])
 
   const adminUpdatePlan = useCallback((planId, updates) => {
