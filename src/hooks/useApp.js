@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useTonConnectUI, useTonWallet, toUserFriendlyAddress } from '@tonconnect/ui-react'
-import { DEFAULT_PLANS, MIN_WITHDRAW, ADMIN_WALLET, ADMIN_IDS, TON_NETWORK } from '../utils/config'
+import { DEFAULT_PLANS, MIN_WITHDRAW, ADMIN_WALLET, ADMIN_IDS, TON_NETWORK, SUPABASE_URL, SUPABASE_ANON_KEY } from '../utils/config'
 import {
   supabase,
   getUserBundle, saveUserBundle,
@@ -351,21 +351,23 @@ export function useApp() {
   // ─── WITHDRAW ────────────────────────────────────────────────────────────
   const submitWithdraw = useCallback(async (amount, walletAddress) => {
     const minWd = Number(config.minWithdraw) || MIN_WITHDRAW
-    if (amount < minWd)        { showToast(`Min: ${minWd} TON`,'err'); return false }
-    if (amount > user.balance) { showToast('Insufficient balance','err'); return false }
-    const destWallet = (walletAddress||'').trim()
-    if (!destWallet) { showToast('Connect your TON wallet first','err'); return false }
-    if (!/^[EUk0][Qg][A-Za-z0-9+/_-]{46}$/.test(destWallet)) {
-      showToast('Invalid wallet address format.','err'); return false
-    }
-    const now  = Date.now()
-    const txId = 'tx-' + now
-    const newBal = Math.max(0, user.balance - amount)
+    if (amount < minWd)        { showToast(`Min: ${minWd} TON`, 'err'); return false }
+    if (amount > user.balance) { showToast('Insufficient balance', 'err'); return false }
 
-    // Optimistic UI update — show result immediately before API responds
-    const prevBalance    = user.balance
-    const prevWalletAddr = user.walletAddr
-    setUser(p => ({ ...p, balance: newBal, walletAddr: destWallet }))
+    const destWallet = (walletAddress || '').trim()
+    if (!destWallet) { showToast('Connect your TON wallet first', 'err'); return false }
+
+    // Validate địa chỉ TON — TEP-0002
+    if (!/^[EUk0][Qg][A-Za-z0-9+/_-]{46}$/.test(destWallet)) {
+      showToast('Invalid wallet address. Please reconnect your wallet.', 'err')
+      return false
+    }
+
+    const now  = Date.now()
+    const txId = `tx-${tid}-${now}`
+
+    // ── Optimistic UI: cập nhật UI ngay trước khi đợi API ──────────────────
+    setUser(p => ({ ...p, balance: Math.max(0, p.balance - amount), walletAddr: destWallet }))
     setTransactions(p => [{
       id: txId, type: 'withdraw',
       label: `Withdrawal → ${destWallet.slice(0, 8)}...`,
@@ -374,35 +376,58 @@ export function useApp() {
     }, ...p])
 
     try {
+      // ── Gọi Supabase Edge Function ────────────────────────────────────────
       const initData = window.Telegram?.WebApp?.initData || ''
-      const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3001/api'
-      const res = await fetch(`${API_BASE}/withdraw`, {
+      const edgeFnUrl = `${SUPABASE_URL}/functions/v1/withdraw`
+
+      const res = await fetch(edgeFnUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ initData, userId: tid, amount, destWallet }),
+        headers: {
+          'Content-Type':  'application/json',
+          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        },
+        body: JSON.stringify({
+          initData,
+          userId:     tid,
+          amount,
+          destWallet,
+        }),
       })
+
       const data = await res.json()
+
       if (!res.ok) {
-        // Rollback optimistic update
-        setUser(p => ({ ...p, balance: prevBalance, walletAddr: prevWalletAddr }))
-        setTransactions(p => p.filter(t => t.id !== txId))
-        showToast(data?.error || 'Failed to submit withdrawal.', 'err')
-        return false
+        throw new Error(data.error || 'Withdrawal failed')
       }
-      // Update balance from backend (authoritative) and mark tx as pending
-      setUser(p => ({ ...p, balance: data.newBalance ?? newBal, walletAddr: destWallet }))
-      setTransactions(p => p.map(t => t.id === txId ? { ...t, status: 'pending' } : t))
+
+      // ── Cập nhật state từ response thực của backend ───────────────────────
+      if (data.newBalance !== undefined) {
+        setUser(p => ({ ...p, balance: data.newBalance, walletAddr: destWallet }))
+      }
+      setTransactions(p => p.map(t =>
+        t.id === txId
+          ? { ...t, id: data.txId || txId, status: data.confirmed ? 'completed' : 'pending' }
+          : t
+      ))
+
       showToast('Withdrawal submitted! Processing... ⏳', 'ok')
       return true
-    } catch(e) {
-      console.error('[withdraw]', e)
-      // Rollback optimistic update
-      setUser(p => ({ ...p, balance: prevBalance, walletAddr: prevWalletAddr }))
+
+    } catch (e) {
+      // ── Rollback optimistic update khi thất bại ───────────────────────────
+      setUser(p => ({ ...p, balance: p.balance + amount }))
       setTransactions(p => p.filter(t => t.id !== txId))
-      showToast('Failed to submit withdrawal.', 'err')
+
+      const msg = e?.message || ''
+      if (/banned/i.test(msg))              showToast('Your account is suspended.', 'err')
+      else if (/Insufficient/i.test(msg))   showToast('Insufficient balance.', 'err')
+      else if (/unavailable/i.test(msg))    showToast('Service busy. Please try again later.', 'err')
+      else                                  showToast('Withdrawal failed. Please try again.', 'err')
+
+      console.error('[withdraw]', e)
       return false
     }
-  }, [config.minWithdraw, user.balance, user.walletAddr, tid, showToast])
+  }, [config.minWithdraw, user.balance, tid, showToast])
 
   const activateInvestment = useCallback(async (invId) => {
     const inv = investments.find(i => i.id===invId)

@@ -1,10 +1,12 @@
 // ─── Supabase ─────────────────────────────────────────────────────
 // 1. Go to https://supabase.com → Project → Settings → API
 // 2. Copy "Project URL" and "anon public" key here
-export const SUPABASE_URL = 'https://xblsdppxltvyvlvxsrkn.supabase.co'  // ← REPLACE THIS
+export const SUPABASE_URL      = 'https://xblsdppxltvyvlvxsrkn.supabase.co'  // ← REPLACE THIS
 export const SUPABASE_ANON_KEY = 'sb_publishable_wZ7Dug3hq1G4Cs_IDwbTuQ_Aw-yvsu3'                   // ← REPLACE THIS
 
-export const API_BASE = 'https://your-api.com/api'
+// API_BASE không cần thiết nữa vì withdraw dùng Supabase Edge Function trực tiếp
+// Edge Function URL: ${SUPABASE_URL}/functions/v1/withdraw
+export const API_BASE = `${SUPABASE_URL}/functions/v1`
 
 // ─── NETWORK ──────────────────────────────────────────────────────
 // 'testnet' = use TON Testnet for deposit/withdraw testing
