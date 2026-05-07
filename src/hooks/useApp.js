@@ -55,7 +55,7 @@ function mkDefaultUser(tgUser) {
   }
 }
 function mkDefaultRef(tid) {
-  return { code: String(tid).slice(-6), friends: 0, commission: 0 }
+  return { code: String(tid), friends: 0, commission: 0 }
 }
 const DEFAULT_CONFIG = {
   minWithdraw: MIN_WITHDRAW,
@@ -116,9 +116,10 @@ export function useApp() {
         if (savedPlans) setPlans(savedPlans)
 
         // Register this user with referral tracking
+        // Telegram bot deep link format: t.me/BOT?start=REF_TELEGRAM_ID
         const sp = window.Telegram?.WebApp?.initDataUnsafe?.start_param || ''
-        const rm = sp.match(/^ref_(.{6})$/)
-        const referredByCode = rm ? `TON-${rm[1]}` : ''
+        // start_param is the referrer's Telegram ID (numeric string)
+        const referredByCode = /^\d{5,12}$/.test(sp) ? sp : ''
         registerUser(tid, referredByCode)
       } catch(e) { console.warn('[load]', e) }
       finally { setTimeout(() => setLoading(false), 500) }
@@ -153,11 +154,12 @@ export function useApp() {
   }, [wallet, config.tonNetwork])
 
   // ─── Referral link: update when botUsername changes ────────────────────────
+  // Format: https://t.me/BOT?start=TELEGRAM_ID (start_param = referrer's Telegram ID)
   useEffect(() => {
     const bot = config.botUsername?.trim()
     const code = bot
-      ? `https://t.me/${bot}?start=ref_${String(tid).slice(-6)}`
-      : `ref_${String(tid).slice(-6)}`
+      ? `https://t.me/${bot}?start=${tid}`
+      : String(tid)
     setReferral(p => ({ ...p, code }))
   }, [config.botUsername, tid])
 
@@ -575,19 +577,25 @@ export function useApp() {
 
   const adminUpdateUser = useCallback(async (userId, updates) => {
     try {
-      const all = await getAllUsersData()
-      const entry = all.find(x => Number(x.id)===Number(userId))
-      if (!entry) { showToast('User not found', 'err'); return }
-      // Preserve full bundle (investments, transactions, referral) — only patch user fields
-      const fullBundle = {
-        investments: entry.bundle.investments || [],
-        transactions: entry.bundle.transactions || [],
-        referral: entry.bundle.referral || {},
-        user: { ...(entry.bundle.user || {}), ...updates },
-      }
-      await saveUserBundle(userId, fullBundle)
-      if (Number(userId)===Number(tid)) setUser(p => ({ ...p, ...updates }))
-      showToast('User updated!','ok')
+      const id = Number(userId)
+      // Map app-layer fields → DB column names
+      const dbPatch = {}
+      if (updates.balance        !== undefined) dbPatch.balance         = Number(updates.balance)
+      if (updates.totalDeposit   !== undefined) dbPatch.total_deposit   = Number(updates.totalDeposit)
+      if (updates.totalWithdraw  !== undefined) dbPatch.total_withdraw  = Number(updates.totalWithdraw)
+      if (updates.todayProfit    !== undefined) dbPatch.today_profit    = Number(updates.todayProfit)
+      if (updates.referrals      !== undefined) dbPatch.referrals       = Number(updates.referrals)
+      if (updates.status         !== undefined) dbPatch.status          = updates.status
+      if (updates.walletAddr     !== undefined) dbPatch.wallet_addr     = updates.walletAddr
+      dbPatch.updated_at = new Date().toISOString()
+
+      const { supabase: sb } = await import('../utils/supabase')
+      const { error } = await sb.from('users').update(dbPatch).eq('id', id)
+      if (error) throw error
+
+      // Keep current user's local state in sync
+      if (id === Number(tid)) setUser(p => ({ ...p, ...updates }))
+      showToast('User updated!', 'ok')
     } catch(e) {
       console.error('[adminUpdateUser]', e)
       showToast('Failed to update user', 'err')

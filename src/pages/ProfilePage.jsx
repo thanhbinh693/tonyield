@@ -50,9 +50,11 @@ export default function ProfilePage({ user, referral, config, showToast, setIsAd
   const refRate = config?.referralRate ?? 5
 
   const copyRef = () => {
+    // referral.code is already a full https://t.me/... link when botUsername is configured
+    // fallback: if bot not configured, show the raw Telegram ID for manual sharing
     const link = referral.code?.startsWith('http')
       ? referral.code
-      : `https://t.me/TONYieldBot?start=ref_${referral.code}`
+      : referral.code  // just the Telegram ID — user can share manually
     navigator.clipboard?.writeText(link).catch(() => {})
     showToast('Referral link copied!')
   }

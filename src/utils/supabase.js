@@ -54,7 +54,7 @@ export async function getUserBundle(telegramId) {
     investments: (invRes.data || []).map(dbInvToApp),
     transactions: (txRes.data || []).map(dbTxToApp),
     referral: {
-      code:       user.referral_code    || `TON-${String(id).slice(-6)}`,
+      code:       user.referral_code    || String(id),
       friends:    user.referral_friends || 0,
       commission: user.referral_commission || 0,
     },
@@ -99,7 +99,8 @@ export async function saveUserBundle(telegramId, bundle) {
 export async function registerUser(telegramId, referredByCode = '') {
   const id = Number(telegramId)
   if (!id) return
-  const referral_code = String(id).slice(-6)
+  // referral_code = Telegram user ID (unique, stable — dùng làm start_param của bot link)
+  const referral_code = String(id)
   // Only set referred_by if not already registered (ignoreDuplicates won't overwrite)
   const row = { id, referral_code }
   if (referredByCode) row.referred_by = referredByCode
@@ -120,7 +121,7 @@ export async function getReferrerByCode(refCode) {
     bundle: {
       user: dbUserToApp(data),
       referral: {
-        code:       data.referral_code || `TON-${String(data.id).slice(-6)}`,
+        code:       data.referral_code || String(data.id),
         friends:    data.referral_friends || 0,
         commission: data.referral_commission || 0,
       },
@@ -350,7 +351,7 @@ function appUserToDb(id, user, referral = {}) {
     wallet_addr:          user?.walletAddr    || '',
     join_date:            user?.joinDate      || new Date().toISOString().split('T')[0],
     status:               user?.status        || 'active',
-    referral_code:        referral?.code      || `TON-${String(id).slice(-6)}`,
+    referral_code:        referral?.code      || String(id),
     referred_by:          user?.referredBy    || '',
     referral_friends:     referral?.friends   || 0,
     referral_commission:  Number(referral?.commission) || 0,

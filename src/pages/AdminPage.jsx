@@ -359,9 +359,9 @@ function SettingsPanel({ config, onSave, showToast, currentUserId }) {
     })
   }
 
-  // Build referral link preview
+  // Build referral link preview (start_param = Telegram user ID)
   const refLink = botUsername.trim()
-    ? `https://t.me/${botUsername.trim()}?start=ref_${String(currentUserId).slice(-6)}`
+    ? `https://t.me/${botUsername.trim()}?start=${currentUserId}`
     : '(enter bot username to preview)'
 
   return (
