@@ -14,8 +14,7 @@ export const TON_NETWORK = 'testnet'
 // ─── ADMIN WALLET ADDRESS — receives deposits ─────────────────────
 // ⚠️  MUST fill in your TON TESTNET wallet address here!
 // Get testnet wallet: open Tonkeeper → Settings → Switch to Testnet
-export const ADMIN_WALLET = '0QBWd0060MGJ2lj6YipK7di5z0OSIL-3lcpwnfhPHUiGaAeH' // ← REPLACE WITH TESTNET ADDRESS
-
+export const ADMIN_WALLET = '0QCKAawZmCsi6MVFQ87Jn7LZ7Tr-4jm6w9r_2M8SdN645TAK'
 // Testnet: short duration + small interval for fast testing
 // Production: change durationUnit='days', duration=30, profitIntervalMinutes=1440
 export const DEFAULT_PLANS = [

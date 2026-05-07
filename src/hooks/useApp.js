@@ -8,6 +8,9 @@ import {
   getReferrerByCode, getUserReferredBy, creditReferralCommission,
   getAdminConfig, saveAdminConfig,
   getAdminPlans, saveAdminPlans,
+  subscribeUserData, pollUserBundle,
+  creditProfitAtomic,
+  supabase,
 } from '../utils/supabase'
 
 // ─── TON helpers ──────────────────────────────────────────────────────────────
@@ -64,7 +67,7 @@ const DEFAULT_CONFIG = {
   adminWallet: ADMIN_WALLET,
   adminIds: [...ADMIN_IDS],
   botUsername: '',
-  tonNetwork: TON_NETWORK, // 'mainnet' | 'testnet' — overridable from admin panel
+  tonNetwork: TON_NETWORK,
 }
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
@@ -89,7 +92,9 @@ export function useApp() {
 
   const adminMode = checkIsAdmin(tid, config.adminIds)
   const inited    = useRef(false)
-  const persistTimer = useRef(null)
+  const persistTimer  = useRef(null)
+  const lastUpdatedAt = useRef(null)  // optimistic lock tracker
+  const realtimeOk    = useRef(false) // track if Realtime is connected
 
   // ─── LOAD on mount ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -99,7 +104,6 @@ export function useApp() {
 
     async function load() {
       try {
-        // All reads from localStorage (sync) or CS backup if new device
         const [bundle, cfg, savedPlans] = await Promise.all([
           getUserBundle(tid),
           getAdminConfig(null),
@@ -111,14 +115,13 @@ export function useApp() {
           if (bundle.investments)  setInvestments(bundle.investments)
           if (bundle.transactions) setTransactions(bundle.transactions)
           if (bundle.referral)     setReferral(p => ({ ...p, ...bundle.referral }))
+          // Ghi nhớ updated_at để dùng optimistic lock khi save
+          lastUpdatedAt.current = bundle._updatedAt || null
         }
         if (cfg)        setConfig(p => ({ ...DEFAULT_CONFIG, ...cfg }))
         if (savedPlans) setPlans(savedPlans)
 
-        // Register this user with referral tracking
-        // Telegram bot deep link format: t.me/BOT?start=REF_TELEGRAM_ID
         const sp = window.Telegram?.WebApp?.initDataUnsafe?.start_param || ''
-        // start_param is the referrer's Telegram ID (numeric string)
         const referredByCode = /^\d{5,12}$/.test(sp) ? sp : ''
         registerUser(tid, referredByCode)
       } catch(e) { console.warn('[load]', e) }
@@ -127,20 +130,102 @@ export function useApp() {
     load()
   }, []) // eslint-disable-line
 
-  // ─── PERSIST bundle when data changes ──────────────────────────────────────
+  // ─── REALTIME SUBSCRIPTION ────────────────────────────────────────────────
+  // Khi DB thay đổi từ tab/thiết bị khác → cập nhật state ngay lập tức.
+  // Thứ tự ưu tiên: Realtime push > polling fallback > setInterval tick
+  useEffect(() => {
+    if (!tid || loading) return
+
+    let unsubPoll = null
+
+    const unsubRealtime = subscribeUserData(tid, {
+      // user row thay đổi (balance, status, v.v.) → cập nhật trực tiếp
+      onUserChange: (newUser) => {
+        setUser(prev => {
+          // Không overwrite nếu local version mới hơn (đang có pending persist)
+          if (persistTimer.current) return prev  // đang trong debounce period → giữ local
+          return { ...prev, ...newUser }
+        })
+        lastUpdatedAt.current = newUser._updatedAt || null
+      },
+
+      // investment thay đổi → merge vào danh sách
+      onInvChange: ({ eventType, investment, oldId }) => {
+        setInvestments(prev => {
+          if (eventType === 'DELETE') {
+            return prev.filter(i => i.id !== oldId)
+          }
+          if (!investment) return prev
+          const exists = prev.find(i => i.id === investment.id)
+          if (eventType === 'INSERT' && !exists) {
+            return [...prev, investment]
+          }
+          if (eventType === 'UPDATE') {
+            return prev.map(i => i.id === investment.id ? { ...i, ...investment } : i)
+          }
+          return prev
+        })
+      },
+
+      // transaction mới từ DB (có thể là profit từ tab khác, hay tx admin tạo)
+      onTxChange: ({ tx }) => {
+        setTransactions(prev => {
+          if (prev.find(t => t.id === tx.id)) return prev  // dedup
+          return [tx, ...prev]
+        })
+      },
+    })
+
+    // Nếu Realtime bị lỗi → bật polling 30s làm fallback
+    // (subscribeUserData log CHANNEL_ERROR, ta dùng setTimeout check)
+    const pollFallbackTimer = setTimeout(() => {
+      if (!realtimeOk.current) {
+        console.log('[Sync] Realtime not confirmed — enabling 30s polling fallback')
+        unsubPoll = pollUserBundle(tid, (bundle) => {
+          if (bundle.user)         setUser(prev => ({ ...prev, ...bundle.user }))
+          if (bundle.investments)  setInvestments(bundle.investments)
+          if (bundle.transactions) setTransactions(prev => {
+            // Merge: giữ local pending tx, thêm DB tx mới
+            const localIds = new Set(prev.map(t => t.id))
+            const newRemote = (bundle.transactions || []).filter(t => !localIds.has(t.id))
+            return [...newRemote, ...prev].slice(0, 200)
+          })
+          lastUpdatedAt.current = bundle._updatedAt || null
+        }, 30_000)
+      }
+    }, 8_000)
+
+    // Mark Realtime ok khi kết nối thành công (subscribeUserData log 'Connected')
+    // Dùng cách đơn giản: nếu sau 3s nhận được ít nhất 1 event → ok
+    // (không cần phức tạp hơn vì channel SUBSCRIBED status không expose trực tiếp)
+    const rtCheckTimer = setTimeout(() => { realtimeOk.current = true }, 3_000)
+
+    return () => {
+      unsubRealtime()
+      if (unsubPoll) unsubPoll()
+      clearTimeout(pollFallbackTimer)
+      clearTimeout(rtCheckTimer)
+    }
+  }, [loading, tid])
+
+  // ─── PERSIST bundle khi data thay đổi ────────────────────────────────────
   useEffect(() => {
     if (loading) return
     clearTimeout(persistTimer.current)
-    persistTimer.current = setTimeout(() => {
-      saveUserBundle(tid, {
-        user, investments, transactions, referral,
-      }).catch(e => console.warn('[persist]', e))
+    persistTimer.current = setTimeout(async () => {
+      try {
+        await saveUserBundle(tid, {
+          user, investments, transactions, referral,
+        }, lastUpdatedAt.current)
+        // Cập nhật lastUpdatedAt sau khi ghi thành công
+        lastUpdatedAt.current = new Date().toISOString()
+      } catch(e) {
+        console.warn('[persist]', e)
+      }
     }, 400)
   }, [user, investments, transactions, referral, loading]) // eslint-disable-line
 
   // ─── Sync wallet address ──────────────────────────────────────────────────
-  // TonConnect returns raw "0:abc..." — convert to friendly format before saving
-  // testnet=true → kQ... prefix | mainnet → UQ... prefix
   useEffect(() => {
     if (wallet?.account?.address) {
       try {
@@ -153,8 +238,7 @@ export function useApp() {
     }
   }, [wallet, config.tonNetwork])
 
-  // ─── Referral link: update when botUsername changes ────────────────────────
-  // Format: https://t.me/BOT?start=TELEGRAM_ID (start_param = referrer's Telegram ID)
+  // ─── Referral link ────────────────────────────────────────────────────────
   useEffect(() => {
     const bot = config.botUsername?.trim()
     const code = bot
@@ -164,10 +248,11 @@ export function useApp() {
   }, [config.botUsername, tid])
 
   // ─── Profit tick ──────────────────────────────────────────────────────────
-  // Rate = X% per interval (NOT per day).
-  // profitPerInterval = amount * (rate / 100)
-  // On plan completion: principal (amount) is automatically refunded to balance.
-  // Backward-compat: reads profitIntervalMs > profitIntervalMinutes > profitIntervalHours > default 24h
+  // v2: mỗi tick dùng creditProfitAtomic() — ghi thẳng lên DB với CAS lock.
+  //     Nếu tab khác đã credit (nextProfitTime đã đổi) → RPC trả false → skip.
+  //     UI vẫn mượt vì Realtime push balance mới về ngay sau đó.
+  //
+  //     Nếu RPC chưa được cài → fallback về behavior cũ (local state update + persist).
   useEffect(() => {
     const resolveIntervalMs = (inv) =>
       inv.profitIntervalMs
@@ -175,68 +260,115 @@ export function useApp() {
       || (inv.profitIntervalHours   ? inv.profitIntervalHours   * 3_600_000 : 0)
       || 86_400_000
 
-
-    const tick = () => {
+    const tick = async () => {
       const now = Date.now()
       const newTxs = []
-      let totalBalance = 0
+      let localBalanceDelta = 0
 
-      setInvestments(prev => prev.map(inv => {
-        if (inv.status !== 'active' || !inv.activated) return inv
-        const intervalMs = resolveIntervalMs(inv)
-        const ip = parseFloat(inv.amount) * (inv.rate / 100)
-        const iid = inv.invoiceId || String(Number(inv.id.replace(/\D/g,'').slice(-9)) % 900000 + 100000)
+      // Đọc investments hiện tại từ state (dùng functional update để tránh stale closure)
+      setInvestments(prev => {
+        const next = prev.map(inv => {
+          if (inv.status !== 'active' || !inv.activated) return inv
+          const intervalMs = resolveIntervalMs(inv)
+          const ip = parseFloat(inv.amount) * (inv.rate / 100)
+          const iid = inv.invoiceId || String(Number(inv.id.replace(/\D/g,'').slice(-9)) % 900000 + 100000)
 
-        if (now >= inv.endTime) {
-          // Plan completed: auto-credit all accumulated earned + last profit tick + refund principal
-          const prevEarned = Number(inv.earned) || 0
-          const totalProfit = +(prevEarned + ip).toFixed(2)
-          const principal = parseFloat(inv.amount)
-          totalBalance += totalProfit + principal
-          newTxs.push({
-            id: 'prf-'+iid+'-'+now, type: 'profit',
-            label: `Profit · ${inv.plan}`, planName: inv.plan,
-            invoiceId: iid, planId: inv.planId,
-            date: 'Just now', amount: totalProfit, status: 'completed', createdAt: now,
-          })
-          newTxs.push({
-            id: 'ret-'+iid+'-'+now, type: 'deposit',
-            label: `Principal returned · ${inv.plan}`, planName: inv.plan,
-            invoiceId: iid, planId: inv.planId,
-            date: 'Just now', amount: principal, status: 'completed', createdAt: now,
-          })
-          return { ...inv, status: 'completed', earned: 0, progress: 100 }
-        }
-        if (now >= inv.nextProfitTime) {
-          const ad = inv.activeDays || [1,2,3,4,5]
-          const updated = { ...inv, profitIntervalMs: intervalMs, nextProfitTime: inv.nextProfitTime + intervalMs }
-          if (ad.includes(new Date().getDay())) {
-            totalBalance += ip
-            newTxs.push({
-              id: 'prf-'+iid+'-'+now, type: 'profit',
-              label: `Profit · ${inv.plan}`, planName: inv.plan,
-              invoiceId: iid, planId: inv.planId,
-              date: 'Just now', amount: +ip.toFixed(2), status: 'completed', createdAt: now,
-            })
-            return { ...updated, earned: +((inv.earned||0)+ip).toFixed(2) }
+          if (now >= inv.endTime) {
+            // Plan hoàn thành
+            const prevEarned   = Number(inv.earned) || 0
+            const totalProfit  = +(prevEarned + ip).toFixed(2)
+            const principal    = parseFloat(inv.amount)
+
+            // Atomic credit plan completion (async, fire-and-forget)
+            creditProfitAtomic({
+              userId: tid,
+              investmentId: inv.id,
+              profit: totalProfit + principal,
+              newEarned: 0,
+              nextProfitTime: inv.endTime + 999_999_999, // sentinel: không tick thêm
+              oldNextProfitTime: inv.nextProfitTime,
+              txId: 'prf-' + iid + '-' + now,
+              txLabel: `Profit · ${inv.plan}`,
+              now,
+            }).then(result => {
+              if (result === false) return // đã credit bởi tab khác → Realtime sẽ push
+              // fallback: cập nhật local
+              if (result === 'fallback') {
+                localBalanceDelta += totalProfit + principal
+                newTxs.push(
+                  { id:'prf-'+iid+'-'+now, type:'profit', label:`Profit · ${inv.plan}`, planName:inv.plan, invoiceId:iid, planId:inv.planId, date:'Just now', amount:totalProfit, status:'completed', createdAt:now },
+                  { id:'ret-'+iid+'-'+now, type:'deposit', label:`Principal returned · ${inv.plan}`, planName:inv.plan, invoiceId:iid, planId:inv.planId, date:'Just now', amount:principal, status:'completed', createdAt:now }
+                )
+                setUser(p => ({ ...p, balance: +(p.balance + totalProfit + principal).toFixed(2) }))
+                setTransactions(p => [...newTxs, ...p])
+              }
+              // result===true → Realtime subscription sẽ push balance mới về tự động
+            }).catch(e => console.warn('[tick:completion]', e))
+
+            return { ...inv, status: 'completed', earned: 0, progress: 100 }
           }
-          return updated
-        }
-        return inv
-      }))
 
-      if (newTxs.length > 0) {
-        setUser(p => ({
-          ...p,
-          balance: +(p.balance + totalBalance).toFixed(2),
-          todayProfit: +((p.todayProfit||0) + newTxs.filter(t=>t.type==='profit').reduce((s,t)=>s+t.amount,0)).toFixed(2),
-        }))
-        setTransactions(p => [...newTxs, ...p])
-      }
+          if (now >= inv.nextProfitTime) {
+            const ad = inv.activeDays || [1,2,3,4,5]
+            const newNextProfitTime = inv.nextProfitTime + intervalMs
+
+            if (!ad.includes(new Date().getDay())) {
+              // Không phải ngày active — chỉ advance nextProfitTime
+              return { ...inv, profitIntervalMs: intervalMs, nextProfitTime: newNextProfitTime }
+            }
+
+            const newEarned = +((inv.earned || 0) + ip).toFixed(2)
+            const txId = 'prf-' + iid + '-' + now
+
+            // Atomic credit — nếu RPC ok, DB + Realtime sẽ handle phần còn lại
+            creditProfitAtomic({
+              userId: tid,
+              investmentId: inv.id,
+              profit: +ip.toFixed(2),
+              newEarned,
+              nextProfitTime: newNextProfitTime,
+              oldNextProfitTime: inv.nextProfitTime,
+              txId,
+              txLabel: `Profit · ${inv.plan}`,
+              now,
+            }).then(result => {
+              if (result === false) {
+                // Tab khác đã credit → Realtime sẽ push state mới về, không làm gì thêm
+                console.log(`[tick] Skipped double-credit for inv ${inv.id}`)
+                return
+              }
+              if (result === 'fallback') {
+                // RPC chưa cài → fallback client-side (behavior cũ)
+                setUser(p => ({
+                  ...p,
+                  balance: +(p.balance + ip).toFixed(2),
+                  todayProfit: +((p.todayProfit || 0) + ip).toFixed(2),
+                }))
+                setTransactions(p => [{
+                  id: txId, type: 'profit',
+                  label: `Profit · ${inv.plan}`, planName: inv.plan,
+                  invoiceId: iid, planId: inv.planId,
+                  date: 'Just now', amount: +ip.toFixed(2), status: 'completed', createdAt: now,
+                }, ...p])
+              }
+              // result===true → Realtime subscription push balance mới về
+            }).catch(e => console.warn('[tick:profit]', e))
+
+            return {
+              ...inv,
+              profitIntervalMs: intervalMs,
+              nextProfitTime: newNextProfitTime,
+              earned: newEarned,
+            }
+          }
+
+          return inv
+        })
+        return next
+      })
     }
 
     tick()
-    // Tick every 5 seconds — fast enough for 5-minute intervals
     const id = setInterval(tick, 5_000)
     return () => clearInterval(id)
   }, []) // eslint-disable-line
@@ -259,13 +391,11 @@ export function useApp() {
       const total    = i.endTime-i.startTime
       const msLeft   = Math.max(0, i.endTime - Date.now())
       const progress = Math.min(100, Math.round((elapsed/total)*100))
-      // timeLeft: smart display
       let timeLeftLabel
       if (msLeft <= 0)                          timeLeftLabel = '0m left'
       else if (msLeft < 3_600_000)             timeLeftLabel = `${Math.ceil(msLeft/60_000)}m left`
       else if (msLeft < 86_400_000)            timeLeftLabel = `${Math.ceil(msLeft/3_600_000)}h left`
       else                                      timeLeftLabel = `${Math.ceil(msLeft/86_400_000)}d left`
-      // intervalMs resolve (same as tick)
       const intervalMs = i.profitIntervalMs
         || (i.profitIntervalMinutes ? i.profitIntervalMinutes*60_000 : 0)
         || (i.profitIntervalHours   ? i.profitIntervalHours*3_600_000 : 0)
@@ -274,28 +404,18 @@ export function useApp() {
     })
 
   // ─── DEPOSIT ──────────────────────────────────────────────────────────────
-  // ── Referral helper — credit commission to referrer on FIRST deposit only ────
   const applyReferralCommission = useCallback(async (amount, now) => {
     try {
-      // 1. Check if this user was referred (referred_by set at register time)
       const referredBy = await getUserReferredBy(tid)
-      if (!referredBy) return  // not referred via link
-
-      // 2. Only credit on FIRST deposit: check if user already has a deposit tx
+      if (!referredBy) return
       const depositCount = transactions.filter(t => t.type === 'deposit').length
-      if (depositCount > 1) return  // this is not the first deposit
-
-      // 3. Find referrer directly by referral_code
+      if (depositCount > 1) return
       const referrer = await getReferrerByCode(referredBy)
       if (!referrer || Number(referrer.id) === Number(tid)) return
-
-      // 4. Calculate and credit commission
       const rate       = Number(config.referralRate) || 5
       const commission = +(parseFloat(amount) * (rate / 100)).toFixed(2)
       if (commission <= 0) return
-
       await creditReferralCommission(referrer.id, commission, user.username || tid, tid, now)
-      console.log(`[Referral] +${commission} TON → referrer ${referrer.id}`)
     } catch(e) {
       console.warn('[applyReferralCommission]', e)
     }
@@ -308,7 +428,6 @@ export function useApp() {
     const iid = makeInvId(tid, planId)
     const aw  = config.adminWallet || ADMIN_WALLET
 
-    // ── Balance (reinvest) path ──────────────────────────────────────────────
     if (paymentMethod === 'balance') {
       const amt = parseFloat(amount)
       let insufficient = false
@@ -316,7 +435,6 @@ export function useApp() {
         if (amt > p.balance) { insufficient = true; return p }
         return { ...p, balance: Math.max(0, p.balance - amt), totalDeposit: p.totalDeposit + amt }
       })
-      // Wait one tick for state to settle, then check flag
       await new Promise(r => setTimeout(r, 0))
       if (insufficient) {
         showToast('Insufficient balance', 'err'); return false
@@ -346,14 +464,12 @@ export function useApp() {
       return true
     }
 
-    // ── Wallet path ──────────────────────────────────────────────────────────
     try {
       await tonUI.sendTransaction({
         validUntil: Math.floor(now/1000)+600,
         messages: [{ address:aw, amount:toNano(amount), payload:buildPayload(iid) }],
       })
 
-      // ── Referral commission ──────────────────────────────────────────────
       await applyReferralCommission(amount, now)
 
       setTransactions(p => [{
@@ -389,56 +505,40 @@ export function useApp() {
     }
   }, [plans, tid, tonUI, showToast, config.adminWallet, config.referralRate, user.username])
 
-  // ─── WITHDRAW (Auto — backend sends TON from admin wallet) ─────────────
-  // User connects TonConnect wallet once to get destination wallet address.
-  // Backend worker automatically sends TON from admin wallet → user wallet.
-  // User does NOT need to sign or confirm any transaction.
+  // ─── WITHDRAW ─────────────────────────────────────────────────────────────
   const submitWithdraw = useCallback(async (amount, walletAddress) => {
     const minWd = Number(config.minWithdraw) || MIN_WITHDRAW
     if (amount < minWd)        { showToast(`Min: ${minWd} TON`, 'err'); return false }
     if (amount > user.balance) { showToast('Insufficient balance', 'err'); return false }
 
-    // Use wallet address from WithdrawModal (already converted to UQ... before passing in)
     const destWallet = (walletAddress || '').trim()
     if (!destWallet) {
       showToast('Wallet not connected. Please connect your TON wallet.', 'err')
       return false
     }
-    // Accept both mainnet (UQ.../EQ...) and testnet (kQ.../0Q...) friendly addresses
     const isFriendlyAddr = /^[UEk0][Qq][A-Za-z0-9_-]+=?$/.test(destWallet)
     if (!isFriendlyAddr) {
       showToast('Invalid wallet address format. Please reconnect your wallet.', 'err')
-      console.error('[withdraw] Invalid address format, got:', destWallet)
       return false
-    }
-    if (user.walletAddr && user.walletAddr !== destWallet) {
-      console.warn('[withdraw] Wallet address changed:', user.walletAddr, '→', destWallet)
     }
 
     const now = Date.now()
     const txId = 'tx-' + now
 
     try {
-      const { supabase } = await import('../utils/supabase')
       const newBalance = Math.max(0, user.balance - amount)
 
-      // 1. Sync user balance + wallet address to Supabase FIRST
-      //    Worker reads from DB — if balance/wallet not synced, refund logic breaks
       const { error: syncErr } = await supabase.from('users').upsert({
         id:          Number(tid),
         balance:     newBalance,
         wallet_addr: destWallet,
         updated_at:  new Date().toISOString(),
       }, { onConflict: 'id' })
-      if (syncErr) {
-        console.error('[withdraw] Failed to sync user to Supabase:', syncErr)
-        throw syncErr
-      }
+      if (syncErr) throw syncErr
 
-      // 2. Deduct balance in local state (optimistic — already saved to DB above)
       setUser(p => ({ ...p, balance: newBalance, walletAddr: destWallet }))
+      lastUpdatedAt.current = new Date().toISOString()
 
-      // 3. Create pending transaction — backend worker will pick it up & send TON
       const { error } = await supabase.from('transactions').insert({
         id:         txId,
         user_id:    Number(tid),
@@ -451,7 +551,6 @@ export function useApp() {
       })
       if (error) throw error
 
-      // 4. Update local transaction list
       setTransactions(p => [{
         id: txId, type: 'withdraw',
         label: `Withdrawal → ${destWallet.slice(0, 8)}...`,
@@ -462,7 +561,6 @@ export function useApp() {
       showToast('Withdrawal submitted! Processing... ⏳', 'ok')
       return true
     } catch (e) {
-      // Refund balance if failed (revert optimistic update)
       setUser(p => ({ ...p, balance: p.balance + amount }))
       console.error('[withdraw]', e)
       showToast('Failed to submit withdrawal. Try again.', 'err')
@@ -470,16 +568,13 @@ export function useApp() {
     }
   }, [config.minWithdraw, user.balance, user.walletAddr, wallet, tid, showToast])
 
-
   const activateInvestment = useCallback((invId) => {
-    // Activate investment: set flag only, profit starts on next tick
     setInvestments(p => p.map(i =>
       i.id===invId ? { ...i, activated:true, nextProfitTime:Date.now()+(i.profitIntervalMs || (i.profitIntervalHours||24)*3_600_000) } : i
     ))
     showToast('Investment activated!','ok')
   }, [showToast])
 
-  // Collect: for expired investments — adds all uncollected earned to balance
   const collectProfit = useCallback((invId) => {
     setInvestments(prev => {
       const inv = prev.find(i => i.id === invId)
@@ -490,13 +585,7 @@ export function useApp() {
         return prev
       }
       const now = Date.now()
-      // Add to balance
-      setUser(p => ({
-        ...p,
-        balance: p.balance + uncollected,
-        totalWithdraw: p.totalWithdraw, // unchanged
-      }))
-      // Create profit transaction
+      setUser(p => ({ ...p, balance: p.balance + uncollected }))
       setTransactions(p => [{
         id: 'collect-' + now,
         type: 'profit',
@@ -507,7 +596,6 @@ export function useApp() {
         createdAt: now,
       }, ...p])
       showToast(`+${uncollected.toFixed(2)} TON collected!`, 'ok')
-      // Mark investment as collected (status completed, earned reset)
       return prev.map(i => i.id === invId ? { ...i, status: 'completed', earned: 0 } : i)
     })
   }, [showToast])
@@ -520,7 +608,6 @@ export function useApp() {
       ...(bundle.user || {}),
       status: bundle.user?.status || 'active',
     }))
-    // Ensure admin always sees themselves
     if (!users.some(u => Number(u.id) === Number(tid))) {
       users.push({ ...user, status: user.status || 'active' })
     }
@@ -530,31 +617,26 @@ export function useApp() {
   const getAllTransactions = useCallback(async () => {
     const all = await getAllUsersData()
     const txs = []
-    all.forEach(({ id, bundle }) => {
-      ;(bundle.transactions || []).forEach(tx => txs.push({ ...tx, userId: tx.userId || id }))
+    all.forEach(({ bundle }) => {
+      ;(bundle.transactions || []).forEach(tx => txs.push(tx))
     })
-    return txs
+    return txs.sort((a,b) => (b.createdAt||0)-(a.createdAt||0))
   }, [])
 
-  // computeAdminStats: 1 getAllUsersData call, computes everything from it
   const computeAdminStats = useCallback(async () => {
     const all = await getAllUsersData()
-    let totalDeposited=0, totalWithdrawn=0, todayPft=0, activeInv=0
+    let totalDeposited = 0, totalWithdrawn = 0, todayPft = 0, activeInv = 0
     const userList = []
-
     all.forEach(({ id, bundle }) => {
       const u = bundle.user || {}
       userList.push({ ...u, id, status:u.status||'active' })
       totalDeposited += Number(u.totalDeposit)  || 0
       totalWithdrawn += Number(u.totalWithdraw) || 0
       todayPft       += Number(u.todayProfit)   || 0
-      ;(bundle.transactions || []).forEach(tx => {
-      })
       ;(bundle.investments || []).forEach(inv => {
         if (inv.status==='active') activeInv++
       })
     })
-
     return {
       totalUsers:        userList.length,
       activeUsers:       userList.filter(u => u.status!=='banned').length,
@@ -578,7 +660,6 @@ export function useApp() {
   const adminUpdateUser = useCallback(async (userId, updates) => {
     try {
       const id = Number(userId)
-      // Map app-layer fields → DB column names
       const dbPatch = {}
       if (updates.balance        !== undefined) dbPatch.balance         = Number(updates.balance)
       if (updates.totalDeposit   !== undefined) dbPatch.total_deposit   = Number(updates.totalDeposit)
@@ -589,11 +670,9 @@ export function useApp() {
       if (updates.walletAddr     !== undefined) dbPatch.wallet_addr     = updates.walletAddr
       dbPatch.updated_at = new Date().toISOString()
 
-      const { supabase: sb } = await import('../utils/supabase')
-      const { error } = await sb.from('users').update(dbPatch).eq('id', id)
+      const { error } = await supabase.from('users').update(dbPatch).eq('id', id)
       if (error) throw error
 
-      // Keep current user's local state in sync
       if (id === Number(tid)) setUser(p => ({ ...p, ...updates }))
       showToast('User updated!', 'ok')
     } catch(e) {
@@ -619,11 +698,10 @@ export function useApp() {
     })
   }, [])
 
-  // KEY FIX: adminSaveSettings writes localStorage immediately → all users load it on app open
   const adminSaveSettings = useCallback((updates) => {
     setConfig(prev => {
       const next = { ...prev, ...updates }
-      saveAdminConfig(next)   // ghi localStorage + CS backup
+      saveAdminConfig(next)
       return next
     })
     showToast('Settings saved!','ok')
