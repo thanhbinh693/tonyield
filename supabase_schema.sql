@@ -19,6 +19,7 @@ create table if not exists users (
   referral_code text    default '',
   referral_friends   int     default 0,
   referral_commission numeric default 0,
+  referred_by   text    default '',
   created_at    timestamptz default now(),
   updated_at    timestamptz default now()
 );

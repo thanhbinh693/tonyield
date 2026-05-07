@@ -62,19 +62,24 @@ export async function getUserBundle(telegramId) {
 }
 
 /**
- * Save entire user bundle to Supabase.
- * Uses upsert to create or update.
+ * Save user non-financial data to Supabase.
+ * IMPORTANT: Does NOT write balance, total_deposit, total_withdraw, today_profit
+ * because those are now managed atomically by credit_profit RPC and backend API.
+ * This prevents stale local state from overwriting correct DB values.
  */
 export async function saveUserBundle(telegramId, bundle) {
   const id = Number(telegramId)
   const { user, investments = [], transactions = [], referral = {} } = bundle
 
-  // 1. Upsert user row
-  const userRow = appUserToDb(id, user, referral)
-  check(
-    await supabase.from('users').upsert(userRow, { onConflict: 'id' }),
-    'saveUserBundle:user'
-  )
+  // 1. Update user row — ONLY non-financial fields to prevent stale overwrites
+  const safeFields = {
+    username:     user?.username   || '',
+    first_name:   user?.firstName  || '',
+    wallet_addr:  user?.walletAddr || '',
+    status:       user?.status     || 'active',
+    updated_at:   new Date().toISOString(),
+  }
+  await supabase.from('users').update(safeFields).eq('id', id)
 
   // 2. Upsert investments (upsert only, do not delete old ones)
   if (investments.length > 0) {
@@ -95,16 +100,40 @@ export async function saveUserBundle(telegramId, bundle) {
   }
 }
 
-/** Register user — upsert with referral_code + referred_by on first register */
+/**
+ * Register user — handles both first-time registration and referral tracking.
+ * For NEW users: inserts with referral_code + referred_by in one go.
+ * For EXISTING users: only sets referred_by if it wasn't already set.
+ */
 export async function registerUser(telegramId, referredByCode = '') {
   const id = Number(telegramId)
   if (!id) return
-  // referral_code = Telegram user ID (unique, stable — dùng làm start_param của bot link)
+
   const referral_code = String(id)
-  // Only set referred_by if not already registered (ignoreDuplicates won't overwrite)
-  const row = { id, referral_code }
-  if (referredByCode) row.referred_by = referredByCode
-  await supabase.from('users').upsert(row, { onConflict: 'id', ignoreDuplicates: true })
+
+  // Step 1: Try insert (new user). ignoreDuplicates avoids error for existing users.
+  await supabase.from('users').upsert(
+    { id, referral_code },
+    { onConflict: 'id', ignoreDuplicates: true }
+  )
+
+  // Step 2: If referral code provided, set referred_by ONLY if not already set.
+  // This handles the case where user existed but opened app again via a referral link.
+  if (referredByCode && String(referredByCode) !== String(id)) {
+    const { data: existing } = await supabase
+      .from('users')
+      .select('referred_by')
+      .eq('id', id)
+      .maybeSingle()
+
+    // Only set if not already referred (prevent referral hijacking)
+    if (existing && (!existing.referred_by || existing.referred_by === '')) {
+      await supabase.from('users').update({
+        referred_by: referredByCode,
+        updated_at:  new Date().toISOString(),
+      }).eq('id', id)
+    }
+  }
 }
 
 /** Find referrer by referral_code directly from DB */
@@ -339,6 +368,9 @@ function dbUserToApp(u) {
 }
 
 function appUserToDb(id, user, referral = {}) {
+  // IMPORTANT: referral_code must ALWAYS be the numeric Telegram ID.
+  // Never use referral.code here because it may contain the full display URL
+  // (e.g., https://t.me/bot?start=12345) which would corrupt the DB lookup.
   return {
     id,
     username:             user?.username      || '',
@@ -351,7 +383,7 @@ function appUserToDb(id, user, referral = {}) {
     wallet_addr:          user?.walletAddr    || '',
     join_date:            user?.joinDate      || new Date().toISOString().split('T')[0],
     status:               user?.status        || 'active',
-    referral_code:        referral?.code      || String(id),
+    referral_code:        String(id),
     referred_by:          user?.referredBy    || '',
     referral_friends:     referral?.friends   || 0,
     referral_commission:  Number(referral?.commission) || 0,

@@ -34,7 +34,11 @@ function isValidTonAddress(addr: string): boolean {
 // Parse any TON address format → normalized friendly string
 function parseToFriendly(raw: string): string | null {
   try {
-    return Address.parse(raw.trim()).toString({ bounceable: false, urlSafe: true })
+    return Address.parse(raw.trim()).toString({
+      bounceable: false,
+      urlSafe: true,
+      testOnly: TON_NETWORK === 'testnet',
+    })
   } catch {
     return null
   }
@@ -160,13 +164,14 @@ Deno.serve(async (req) => {
     // ── 8. Trừ balance + lưu transaction (atomic-like) ───────────────────────
     const newBalance = +(Number(user.balance) - amt).toFixed(6)
     const txId = `tx-${uid}-${Date.now()}`
-    const now = new Date().toISOString()
+    const nowMs = Date.now()
+    const nowIso = new Date(nowMs).toISOString()
 
     // Bước A: Trừ balance
     const { error: deductErr } = await supabase.from('users').update({
       balance:     newBalance,
       wallet_addr: toWallet,
-      updated_at:  now,
+      updated_at:  nowIso,
     }).eq('id', uid)
 
     if (deductErr) {
@@ -183,8 +188,8 @@ Deno.serve(async (req) => {
       amount:     amt,
       status:     'processing',
       to_wallet:  toWallet,
-      created_at: now,
-      updated_at: now,
+      created_at: nowMs,
+      updated_at: nowIso,
     })
 
     // Rollback nếu insert thất bại

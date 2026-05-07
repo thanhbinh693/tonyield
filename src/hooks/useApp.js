@@ -3,7 +3,7 @@ import { useTonConnectUI, useTonWallet, toUserFriendlyAddress } from '@tonconnec
 import { DEFAULT_PLANS, MIN_WITHDRAW, ADMIN_WALLET, ADMIN_IDS, TON_NETWORK, SUPABASE_URL, SUPABASE_ANON_KEY, WITHDRAW_URL } from '../utils/config'
 import {
   supabase,
-  getUserBundle, saveUserBundle,
+  getUserBundle,
   registerUser,
   getAllUsersData,
   getReferrerByCode, getUserReferredBy, creditReferralCommission,
@@ -86,10 +86,12 @@ export function useApp() {
   const [plans,        setPlans]        = useState(DEFAULT_PLANS)
   const [config,       setConfig]       = useState({ ...DEFAULT_CONFIG })
 
+  // Display-only referral link (NOT stored in DB)
+  const [referralLink, setReferralLink] = useState(String(tid))
+
   const adminMode    = checkIsAdmin(tid, config.adminIds)
   const inited       = useRef(false)
-  const persistTimer = useRef(null)
-  const lastSnapshot = useRef(null)
+  const applyingRemote = useRef(false)
 
   // ─── LOAD on mount: DB is source of truth ─────────────────────────────────
   useEffect(() => {
@@ -117,8 +119,9 @@ export function useApp() {
         if (savedPlans) setPlans(savedPlans)
 
         // Step 3: Register + upsert fresh Telegram identity info
+        // Telegram IDs can be 5–15+ digits, accept any pure numeric string
         const sp = window.Telegram?.WebApp?.initDataUnsafe?.start_param || ''
-        const referredByCode = /^\d{5,12}$/.test(sp) ? sp : ''
+        const referredByCode = /^\d{5,15}$/.test(sp) ? sp : ''
         await registerUser(tid, referredByCode)
 
         // Keep username/firstName fresh from Telegram (non-destructive to balance etc)
@@ -140,19 +143,60 @@ export function useApp() {
     load()
   }, []) // eslint-disable-line
 
-  // ─── PERSIST: debounced, skip if nothing changed ───────────────────────────
+  // ─── No more saveUserBundle persist — DB writes happen atomically
+  //     at the point of each action (deposit, withdraw, profit tick).
+  //     This eliminates the last-write-wins race condition across devices.
+
+  // Keep multiple devices closer to the same DB state.
   useEffect(() => {
-    if (loading) return
-    clearTimeout(persistTimer.current)
-    persistTimer.current = setTimeout(async () => {
-      const snap = JSON.stringify({ user, investments, transactions, referral })
-      if (snap === lastSnapshot.current) return
-      lastSnapshot.current = snap
-      try {
-        await saveUserBundle(tid, { user, investments, transactions, referral })
-      } catch(e) { console.warn('[persist]', e) }
-    }, 600)
-  }, [user, investments, transactions, referral, loading]) // eslint-disable-line
+    if (loading || !tid) return
+
+    let refreshTimer = null
+    const refreshFromDb = () => {
+      clearTimeout(refreshTimer)
+      refreshTimer = setTimeout(async () => {
+        try {
+          const bundle = await getUserBundle(tid)
+          if (!bundle) return
+
+          applyingRemote.current = true
+          if (bundle.user)         setUser(p => ({ ...p, ...bundle.user }))
+          if (bundle.investments)  setInvestments(bundle.investments)
+          if (bundle.transactions) setTransactions(bundle.transactions)
+          if (bundle.referral)     setReferral(p => ({ ...p, ...bundle.referral }))
+
+          lastSnapshot.current = JSON.stringify({
+            user: bundle.user || user,
+            investments: bundle.investments || [],
+            transactions: bundle.transactions || [],
+            referral: bundle.referral || referral,
+          })
+          setTimeout(() => { applyingRemote.current = false }, 100)
+        } catch (e) {
+          console.warn('[realtime refresh]', e)
+          applyingRemote.current = false
+        }
+      }, 250)
+    }
+
+    const channel = supabase
+      .channel(`user-sync-${tid}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'users', filter: `id=eq.${tid}` }, refreshFromDb)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'investments', filter: `user_id=eq.${tid}` }, refreshFromDb)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'transactions', filter: `user_id=eq.${tid}` }, refreshFromDb)
+      .subscribe()
+
+    const onFocus = () => refreshFromDb()
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onFocus)
+
+    return () => {
+      clearTimeout(refreshTimer)
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onFocus)
+      supabase.removeChannel(channel)
+    }
+  }, [loading, tid]) // eslint-disable-line
 
   // ─── Sync wallet address ──────────────────────────────────────────────────
   useEffect(() => {
@@ -167,66 +211,125 @@ export function useApp() {
     }
   }, [wallet, config.tonNetwork])
 
-  // ─── Referral link ────────────────────────────────────────────────────────
+  // ─── Referral display link (NOT saved to DB — DB keeps numeric referral_code) ──
   useEffect(() => {
     const bot = config.botUsername?.trim()
-    const code = bot ? `https://t.me/${bot}?start=${tid}` : String(tid)
-    setReferral(p => ({ ...p, code }))
+    const link = bot ? `https://t.me/${bot}?start=${tid}` : String(tid)
+    setReferralLink(link)
   }, [config.botUsername, tid])
 
-  // ─── Profit tick ──────────────────────────────────────────────────────────
+  // ─── Profit tick (uses credit_profit RPC for CAS — prevents double-credit) ──
   useEffect(() => {
+    if (loading) return
+
     const resolveMs = (inv) =>
       inv.profitIntervalMs
       || (inv.profitIntervalMinutes ? inv.profitIntervalMinutes * 60_000 : 0)
       || (inv.profitIntervalHours   ? inv.profitIntervalHours   * 3_600_000 : 0)
       || 86_400_000
 
-    const tick = () => {
+    const tick = async () => {
       const now = Date.now()
-      const newTxs = []
-      let totalBalance = 0
 
-      setInvestments(prev => prev.map(inv => {
-        if (inv.status !== 'active' || !inv.activated) return inv
+      // Collect all investments that need processing this tick
+      const toProcess = []
+      setInvestments(prev => {
+        prev.forEach(inv => {
+          if (inv.status !== 'active' || !inv.activated) return
+          if (now >= inv.nextProfitTime) {
+            toProcess.push({ ...inv })
+          }
+        })
+        return prev // Don't mutate yet — wait for DB confirmation
+      })
+
+      for (const inv of toProcess) {
         const intervalMs = resolveMs(inv)
-        const ip  = parseFloat(inv.amount) * (inv.rate / 100)
+        const ip  = +(parseFloat(inv.amount) * (inv.rate / 100)).toFixed(6)
         const iid = inv.invoiceId || String(Number(inv.id.replace(/\D/g,'').slice(-9)) % 900000 + 100000)
 
         if (now >= inv.endTime) {
+          // Plan completed — credit remaining profit + return principal
           const totalProfit = +((Number(inv.earned)||0) + ip).toFixed(2)
           const principal   = parseFloat(inv.amount)
-          totalBalance += totalProfit + principal
-          newTxs.push({ id:'prf-'+iid+'-'+now, type:'profit',   label:`Profit · ${inv.plan}`,            invoiceId:iid, planId:inv.planId, date:'Just now', amount:totalProfit, status:'completed', createdAt:now })
-          newTxs.push({ id:'ret-'+iid+'-'+now, type:'deposit',  label:`Principal returned · ${inv.plan}`, invoiceId:iid, planId:inv.planId, date:'Just now', amount:principal,  status:'completed', createdAt:now })
-          return { ...inv, status:'completed', earned:0, progress:100 }
-        }
-        if (now >= inv.nextProfitTime) {
-          const updated = { ...inv, profitIntervalMs: intervalMs, nextProfitTime: inv.nextProfitTime + intervalMs }
-          if ((inv.activeDays || [1,2,3,4,5]).includes(new Date().getDay())) {
-            totalBalance += ip
-            newTxs.push({ id:'prf-'+iid+'-'+now, type:'profit', label:`Profit · ${inv.plan}`, invoiceId:iid, planId:inv.planId, date:'Just now', amount:+ip.toFixed(2), status:'completed', createdAt:now })
-            return { ...updated, earned:+((inv.earned||0)+ip).toFixed(2) }
-          }
-          return updated
-        }
-        return inv
-      }))
 
-      if (newTxs.length > 0) {
-        setUser(p => ({
-          ...p,
-          balance:     +(p.balance + totalBalance).toFixed(2),
-          todayProfit: +((p.todayProfit||0) + newTxs.filter(t=>t.type==='profit').reduce((s,t)=>s+t.amount,0)).toFixed(2),
-        }))
-        setTransactions(p => [...newTxs, ...p])
+          const txIdPrf = 'prf-'+iid+'-'+now
+          const { data: ok } = await supabase.rpc('credit_profit', {
+            p_user_id:       Number(tid),
+            p_investment_id: inv.id,
+            p_profit:        totalProfit + principal,
+            p_new_earned:    0,
+            p_next_time:     now,
+            p_old_next_time: inv.nextProfitTime,
+            p_tx_id:         txIdPrf,
+            p_tx_label:      `Profit · ${inv.plan}`,
+            p_now:           now,
+          })
+          if (ok) {
+            // Mark investment completed in DB
+            await supabase.from('investments').update({ status: 'completed', earned: 0, updated_at: new Date().toISOString() }).eq('id', inv.id)
+            // Insert principal return tx
+            await supabase.from('transactions').insert({
+              id: 'ret-'+iid+'-'+now, user_id: Number(tid), type: 'deposit',
+              label: `Principal returned · ${inv.plan}`, amount: principal,
+              status: 'completed', invoice_id: iid, plan_id: inv.planId, created_at: now,
+            }).catch(() => {})
+            // Refresh from DB
+            const bundle = await getUserBundle(tid)
+            if (bundle) {
+              applyingRemote.current = true
+              if (bundle.user)         setUser(p => ({ ...p, ...bundle.user }))
+              if (bundle.investments)  setInvestments(bundle.investments)
+              if (bundle.transactions) setTransactions(bundle.transactions)
+              setTimeout(() => { applyingRemote.current = false }, 100)
+            }
+          }
+          continue
+        }
+
+        // Normal profit tick — use CAS
+        if (!(inv.activeDays || [1,2,3,4,5]).includes(new Date().getDay())) {
+          // Inactive day — just advance timer without crediting
+          await supabase.from('investments').update({
+            next_profit_time: inv.nextProfitTime + intervalMs,
+            updated_at: new Date().toISOString(),
+          }).eq('id', inv.id).eq('next_profit_time', inv.nextProfitTime)
+          continue
+        }
+
+        const newEarned = +((Number(inv.earned)||0) + ip).toFixed(2)
+        const txId      = 'prf-'+iid+'-'+now
+        const { data: ok } = await supabase.rpc('credit_profit', {
+          p_user_id:       Number(tid),
+          p_investment_id: inv.id,
+          p_profit:        +ip.toFixed(2),
+          p_new_earned:    newEarned,
+          p_next_time:     inv.nextProfitTime + intervalMs,
+          p_old_next_time: inv.nextProfitTime,
+          p_tx_id:         txId,
+          p_tx_label:      `Profit · ${inv.plan}`,
+          p_now:           now,
+        })
+
+        if (ok) {
+          // CAS succeeded — this tab won, update local state from DB
+          const bundle = await getUserBundle(tid)
+          if (bundle) {
+            applyingRemote.current = true
+            if (bundle.user)         setUser(p => ({ ...p, ...bundle.user }))
+            if (bundle.investments)  setInvestments(bundle.investments)
+            if (bundle.transactions) setTransactions(bundle.transactions)
+            setTimeout(() => { applyingRemote.current = false }, 100)
+          }
+        }
+        // If ok === false → another device already credited, skip silently
       }
     }
 
     tick()
     const id = setInterval(tick, 5_000)
     return () => clearInterval(id)
-  }, []) // eslint-disable-line
+  }, [loading, tid]) // eslint-disable-line
 
   const showToast = useCallback((msg, type='ok') => {
     setToast({msg,type}); setTimeout(()=>setToast(null), 2800)
@@ -363,20 +466,8 @@ export function useApp() {
       return false
     }
 
-    const now  = Date.now()
-    const txId = `tx-${tid}-${now}`
-
-    // ── Optimistic UI: cập nhật UI ngay trước khi đợi API ──────────────────
-    setUser(p => ({ ...p, balance: Math.max(0, p.balance - amount), walletAddr: destWallet }))
-    setTransactions(p => [{
-      id: txId, type: 'withdraw',
-      label: `Withdrawal → ${destWallet.slice(0, 8)}...`,
-      date: 'Just now', amount: -amount, status: 'processing',
-      createdAt: now, toWallet: destWallet, userId: tid,
-    }, ...p])
-
     try {
-      // ── Gọi Supabase Edge Function ────────────────────────────────────────
+      // ── Gọi backend — KHÔNG dùng optimistic update để tránh conflict ─────
       const initData = window.Telegram?.WebApp?.initData || ''
 
       const res = await fetch(WITHDRAW_URL, {
@@ -399,26 +490,23 @@ export function useApp() {
         throw new Error(data.error || 'Withdrawal failed')
       }
 
-      // ── Cập nhật state từ response thực của backend ───────────────────────
-      // Backend đã trừ balance và lưu tx — cập nhật balance chính xác từ DB
-      if (data.newBalance !== undefined) {
+      // ── Refresh state from DB after backend confirmed ────────────────────
+      const bundle = await getUserBundle(tid)
+      if (bundle) {
+        applyingRemote.current = true
+        if (bundle.user)         setUser(p => ({ ...p, ...bundle.user }))
+        if (bundle.investments)  setInvestments(bundle.investments)
+        if (bundle.transactions) setTransactions(bundle.transactions)
+        setTimeout(() => { applyingRemote.current = false }, 100)
+      } else if (data.newBalance !== undefined) {
+        // Fallback if bundle fetch fails
         setUser(p => ({ ...p, balance: data.newBalance, walletAddr: destWallet }))
       }
-      // Nếu blockchain confirm trong 60s → completed, ngược lại → pending (worker sẽ xử lý tiếp)
-      setTransactions(p => p.map(t =>
-        t.id === txId
-          ? { ...t, id: data.txId || txId, status: data.confirmed ? 'completed' : 'pending' }
-          : t
-      ))
 
       showToast('Withdrawal submitted! Processing... ⏳', 'ok')
       return true
 
     } catch (e) {
-      // ── Rollback optimistic update khi thất bại ───────────────────────────
-      setUser(p => ({ ...p, balance: p.balance + amount }))
-      setTransactions(p => p.filter(t => t.id !== txId))
-
       const msg = e?.message || ''
       if (/banned/i.test(msg))              showToast('Your account is suspended.', 'err')
       else if (/Insufficient/i.test(msg))   showToast('Insufficient balance.', 'err')
@@ -560,9 +648,15 @@ export function useApp() {
     showToast('Settings saved!','ok')
   }, [showToast])
 
+  // Build referral object for display — use referralLink (URL), not DB referral_code
+  const referralDisplay = {
+    ...referral,
+    code: referralLink,  // Display: full URL or numeric ID
+  }
+
   return {
     tab, setTab, loading, toast, config,
-    user, plans, investments:myInvestments, transactions, referral,
+    user, plans, investments:myInvestments, transactions, referral: referralDisplay,
     isAdmin:adminMode, isAdminView, setIsAdmin:setIsAdminView,
     walletConnected:!!wallet, wallet,
     connectWallet, disconnectWallet, showToast,
