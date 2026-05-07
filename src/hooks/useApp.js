@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useTonConnectUI, useTonWallet, toUserFriendlyAddress } from '@tonconnect/ui-react'
-import { DEFAULT_PLANS, MIN_WITHDRAW, ADMIN_WALLET, ADMIN_IDS, TON_NETWORK, SUPABASE_URL, SUPABASE_ANON_KEY } from '../utils/config'
+import { DEFAULT_PLANS, MIN_WITHDRAW, ADMIN_WALLET, ADMIN_IDS, TON_NETWORK, SUPABASE_URL, SUPABASE_ANON_KEY, BACKEND_URL } from '../utils/config'
 import {
   supabase,
   getUserBundle, saveUserBundle,
@@ -376,16 +376,13 @@ export function useApp() {
     }, ...p])
 
     try {
-      // ── Gọi Supabase Edge Function ────────────────────────────────────────
-      const initData = window.Telegram?.WebApp?.initData || ''
-      const edgeFnUrl = `${SUPABASE_URL}/functions/v1/withdraw`
+      // ── Gọi Backend Express API ───────────────────────────────────────────
+      const initData   = window.Telegram?.WebApp?.initData || ''
+      const backendUrl = (BACKEND_URL || 'http://localhost:3001').replace(/\/$/, '')
 
-      const res = await fetch(edgeFnUrl, {
+      const res = await fetch(`${backendUrl}/api/withdraw`, {
         method: 'POST',
-        headers: {
-          'Content-Type':  'application/json',
-          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           initData,
           userId:     tid,
@@ -401,12 +398,14 @@ export function useApp() {
       }
 
       // ── Cập nhật state từ response thực của backend ───────────────────────
+      // Backend đã trừ balance và lưu tx pending — cập nhật balance chính xác từ DB
       if (data.newBalance !== undefined) {
         setUser(p => ({ ...p, balance: data.newBalance, walletAddr: destWallet }))
       }
+      // Backend insert tx với status 'pending' — worker sẽ xử lý gửi TON async
       setTransactions(p => p.map(t =>
         t.id === txId
-          ? { ...t, id: data.txId || txId, status: data.confirmed ? 'completed' : 'pending' }
+          ? { ...t, id: data.txId || txId, status: 'pending' }
           : t
       ))
 

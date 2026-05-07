@@ -4,9 +4,11 @@
 export const SUPABASE_URL      = 'https://xblsdppxltvyvlvxsrkn.supabase.co'  // ← REPLACE THIS
 export const SUPABASE_ANON_KEY = 'sb_publishable_wZ7Dug3hq1G4Cs_IDwbTuQ_Aw-yvsu3'                   // ← REPLACE THIS
 
-// API_BASE không cần thiết nữa vì withdraw dùng Supabase Edge Function trực tiếp
-// Edge Function URL: ${SUPABASE_URL}/functions/v1/withdraw
-export const API_BASE = `${SUPABASE_URL}/functions/v1`
+// ─── Backend Express API ───────────────────────────────────────────
+// URL của withdrawal-worker.js Express server
+// Dev: http://localhost:3001
+// Production: https://your-server.com (hoặc dùng ngrok khi test)
+export const BACKEND_URL = 'http://localhost:3001'
 
 // ─── NETWORK ──────────────────────────────────────────────────────
 // 'testnet' = use TON Testnet for deposit/withdraw testing
