@@ -1,23 +1,24 @@
 /**
- * supabase.js — Data layer using Supabase
+ * supabase.js — Data layer using Supabase instead of localStorage/CloudStorage
  * ─────────────────────────────────────────────────────────────────────────────
- * v2 — Nâng cấp đồng bộ real-time:
- *   • Realtime subscription cho user row + investments (push tức thì giữa 2 tab/máy)
- *   • creditProfitAtomic() dùng Postgres RPC để tránh double-credit khi 2 tab cùng tick
- *   • saveUserBundle() dùng optimistic lock (updated_at) → tab cũ không overwrite tab mới
- *   • pollUserBundle() — fallback polling 30s nếu Realtime bị block (proxy/firewall)
+ * All functions are async and return the same interface as the old cloudStorage.js
+ * so useApp.js does not need to change its business logic.
+ *
+ * SETUP:
+ *   1. Run supabase_schema.sql in Supabase Dashboard → SQL Editor
+ *   2. Fill in SUPABASE_URL and SUPABASE_ANON_KEY in src/utils/config.js
+ *   3. npm install @supabase/supabase-js
  */
 
 import { createClient } from '@supabase/supabase-js'
 import { SUPABASE_URL, SUPABASE_ANON_KEY, DEFAULT_PLANS } from './config'
 
 // ─── Supabase client ──────────────────────────────────────────────────────────
-export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-  realtime: { params: { eventsPerSecond: 10 } },
-})
+export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/** Throw error if Supabase query fails */
 function check(result, label = '') {
   if (result.error) {
     console.error(`[supabase] ${label}`, result.error)
@@ -27,7 +28,14 @@ function check(result, label = '') {
 }
 
 // ─── USER BUNDLE ─────────────────────────────────────────────────────────────
+//
+// "Bundle" is object { user, investments, transactions, referral }
+// used to maintain the same interface as the old useApp.js.
 
+/**
+ * Load user bundle from Supabase.
+ * If user does not exist → returns null (useApp will use default).
+ */
 export async function getUserBundle(telegramId) {
   const id = Number(telegramId)
 
@@ -40,6 +48,7 @@ export async function getUserBundle(telegramId) {
   const user = userRes.data
   if (!user) return null
 
+  // Map snake_case → camelCase to match useApp.js
   return {
     user: dbUserToApp(user),
     investments: (invRes.data || []).map(dbInvToApp),
@@ -49,41 +58,25 @@ export async function getUserBundle(telegramId) {
       friends:    user.referral_friends || 0,
       commission: user.referral_commission || 0,
     },
-    _updatedAt: user.updated_at, // dùng cho optimistic lock
   }
 }
 
 /**
- * saveUserBundle — optimistic lock bằng updated_at.
- * Nếu DB đã có bản mới hơn (tab khác vừa ghi), bỏ qua để tránh overwrite.
+ * Save entire user bundle to Supabase.
+ * Uses upsert to create or update.
  */
-export async function saveUserBundle(telegramId, bundle, lastKnownUpdatedAt = null) {
+export async function saveUserBundle(telegramId, bundle) {
   const id = Number(telegramId)
   const { user, investments = [], transactions = [], referral = {} } = bundle
 
-  // 1. Upsert user row — kiểm tra optimistic lock
-  const userRow = { ...appUserToDb(id, user, referral) }
+  // 1. Upsert user row
+  const userRow = appUserToDb(id, user, referral)
+  check(
+    await supabase.from('users').upsert(userRow, { onConflict: 'id' }),
+    'saveUserBundle:user'
+  )
 
-  if (lastKnownUpdatedAt) {
-    const { data: current } = await supabase
-      .from('users').select('updated_at').eq('id', id).maybeSingle()
-    // Nếu DB đã có bản mới hơn → không overwrite balance/data
-    if (current && current.updated_at > lastKnownUpdatedAt) {
-      console.warn('[saveUserBundle] Skipping user row — newer version in DB (another tab wrote first)')
-    } else {
-      check(
-        await supabase.from('users').upsert(userRow, { onConflict: 'id' }),
-        'saveUserBundle:user'
-      )
-    }
-  } else {
-    check(
-      await supabase.from('users').upsert(userRow, { onConflict: 'id' }),
-      'saveUserBundle:user'
-    )
-  }
-
-  // 2. Upsert investments
+  // 2. Upsert investments (upsert only, do not delete old ones)
   if (investments.length > 0) {
     const invRows = investments.map(i => appInvToDb(id, i))
     check(
@@ -102,202 +95,26 @@ export async function saveUserBundle(telegramId, bundle, lastKnownUpdatedAt = nu
   }
 }
 
-// ─── ATOMIC PROFIT CREDIT ─────────────────────────────────────────────────────
-/**
- * creditProfitAtomic — cộng profit và cập nhật next_profit_time ngay trên DB
- * bằng Postgres RPC để tránh double-credit khi 2 tab cùng tick vào cùng lúc.
- *
- * ═══════════════════════════════════════════════════════════════════════════
- * Chạy SQL này trong Supabase Dashboard → SQL Editor trước khi dùng:
- * ═══════════════════════════════════════════════════════════════════════════
- * CREATE OR REPLACE FUNCTION credit_profit(
- *   p_user_id        BIGINT,
- *   p_investment_id  TEXT,
- *   p_profit         NUMERIC,
- *   p_new_earned     NUMERIC,
- *   p_next_time      BIGINT,
- *   p_old_next_time  BIGINT,
- *   p_tx_id          TEXT,
- *   p_tx_label       TEXT,
- *   p_now            BIGINT
- * ) RETURNS BOOLEAN LANGUAGE plpgsql AS $$
- * DECLARE updated_count INT;
- * BEGIN
- *   -- Atomic CAS: chỉ update nếu next_profit_time vẫn là giá trị cũ
- *   UPDATE investments SET
- *     earned = p_new_earned,
- *     next_profit_time = p_next_time,
- *     updated_at = NOW()
- *   WHERE id = p_investment_id
- *     AND user_id = p_user_id
- *     AND next_profit_time = p_old_next_time;
- *   GET DIAGNOSTICS updated_count = ROW_COUNT;
- *   IF updated_count = 0 THEN RETURN FALSE; END IF;
- *
- *   UPDATE users SET
- *     balance = balance + p_profit,
- *     today_profit = today_profit + p_profit,
- *     updated_at = NOW()
- *   WHERE id = p_user_id;
- *
- *   INSERT INTO transactions(id, user_id, type, label, amount, status, created_at)
- *   VALUES(p_tx_id, p_user_id, 'profit', p_tx_label, p_profit, 'completed', p_now)
- *   ON CONFLICT (id) DO NOTHING;
- *
- *   RETURN TRUE;
- * END;
- * $$;
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * Returns:
- *   true     = profit credited successfully
- *   false    = skipped (đã credit bởi tab khác — nextProfitTime đã đổi)
- *   'fallback' = RPC chưa tồn tại, dùng client-side (legacy)
- */
-export async function creditProfitAtomic({
-  userId, investmentId, profit, newEarned,
-  nextProfitTime, oldNextProfitTime,
-  txId, txLabel, now,
-}) {
-  try {
-    const { data, error } = await supabase.rpc('credit_profit', {
-      p_user_id:       Number(userId),
-      p_investment_id: investmentId,
-      p_profit:        profit,
-      p_new_earned:    newEarned,
-      p_next_time:     nextProfitTime,
-      p_old_next_time: oldNextProfitTime,
-      p_tx_id:         txId,
-      p_tx_label:      txLabel,
-      p_now:           now,
-    })
-    if (error) throw error
-    return data === true
-  } catch (e) {
-    if (e?.code === 'PGRST202' || e?.message?.includes('not exist')) {
-      console.warn('[creditProfitAtomic] RPC credit_profit not found — using client fallback (install SQL function to prevent double-credit)')
-      return 'fallback'
-    }
-    console.error('[creditProfitAtomic]', e)
-    return 'fallback'
-  }
-}
-
-// ─── REALTIME SUBSCRIPTION ────────────────────────────────────────────────────
-
-/**
- * subscribeUserData — subscribe Supabase Realtime cho user + investments + tx.
- * Gọi callback ngay khi DB thay đổi từ bất kỳ tab/thiết bị nào.
- *
- * @param {number} telegramId
- * @param {object} callbacks
- *   onUserChange(newUserObj)               — user row thay đổi (balance, status...)
- *   onInvChange({ eventType, investment, oldId }) — investment insert/update/delete
- *   onTxChange({ eventType, tx })          — transaction mới insert
- * @returns {function} unsubscribe — gọi khi component unmount
- */
-export function subscribeUserData(telegramId, { onUserChange, onInvChange, onTxChange } = {}) {
-  const id = Number(telegramId)
-  const channelName = `user-rt-${id}`
-
-  const channel = supabase
-    .channel(channelName)
-    .on('postgres_changes', {
-      event: '*',
-      schema: 'public',
-      table: 'users',
-      filter: `id=eq.${id}`,
-    }, (payload) => {
-      if (payload.new && onUserChange) {
-        onUserChange(dbUserToApp(payload.new))
-      }
-    })
-    .on('postgres_changes', {
-      event: '*',
-      schema: 'public',
-      table: 'investments',
-      filter: `user_id=eq.${id}`,
-    }, (payload) => {
-      if (onInvChange) {
-        onInvChange({
-          eventType:  payload.eventType,
-          investment: payload.new ? dbInvToApp(payload.new) : null,
-          oldId:      payload.old?.id,
-        })
-      }
-    })
-    .on('postgres_changes', {
-      event: 'INSERT',
-      schema: 'public',
-      table: 'transactions',
-      filter: `user_id=eq.${id}`,
-    }, (payload) => {
-      if (onTxChange && payload.new) {
-        onTxChange({
-          eventType: payload.eventType,
-          tx: dbTxToApp(payload.new),
-        })
-      }
-    })
-    .subscribe((status, err) => {
-      if (status === 'SUBSCRIBED') {
-        console.log(`[Realtime] Connected: ${channelName}`)
-      } else if (status === 'CHANNEL_ERROR') {
-        console.warn('[Realtime] Channel error — polling fallback will handle sync', err)
-      } else if (status === 'TIMED_OUT') {
-        console.warn('[Realtime] Timed out — will retry automatically')
-      }
-    })
-
-  return () => {
-    supabase.removeChannel(channel)
-    console.log(`[Realtime] Unsubscribed: ${channelName}`)
-  }
-}
-
-/**
- * pollUserBundle — polling fallback mỗi 30s.
- * Dùng khi Realtime không khả dụng (proxy, firewall corporate, Telegram WebView cũ).
- * Hook useApp sẽ tự bật polling nếu Realtime báo lỗi.
- *
- * @returns {function} unsubscribe
- */
-export function pollUserBundle(telegramId, onBundle, intervalMs = 30_000) {
-  let active = true
-  const run = async () => {
-    if (!active) return
-    try {
-      const bundle = await getUserBundle(telegramId)
-      if (bundle && active) onBundle(bundle)
-    } catch (e) {
-      console.warn('[poll]', e)
-    }
-  }
-  // Delay first poll 5s để không đụng load ban đầu
-  const init = setTimeout(run, 5_000)
-  const timer = setInterval(run, intervalMs)
-  return () => {
-    active = false
-    clearTimeout(init)
-    clearInterval(timer)
-  }
-}
-
-// ─── REGISTER ─────────────────────────────────────────────────────────────────
-
+/** Register user — upsert with referral_code + referred_by on first register */
 export async function registerUser(telegramId, referredByCode = '') {
   const id = Number(telegramId)
   if (!id) return
+  // referral_code = Telegram user ID (unique, stable — dùng làm start_param của bot link)
   const referral_code = String(id)
+  // Only set referred_by if not already registered (ignoreDuplicates won't overwrite)
   const row = { id, referral_code }
   if (referredByCode) row.referred_by = referredByCode
   await supabase.from('users').upsert(row, { onConflict: 'id', ignoreDuplicates: true })
 }
 
+/** Find referrer by referral_code directly from DB */
 export async function getReferrerByCode(refCode) {
   if (!refCode) return null
   const { data } = await supabase
-    .from('users').select('*').eq('referral_code', refCode).maybeSingle()
+    .from('users')
+    .select('*')
+    .eq('referral_code', refCode)
+    .maybeSingle()
   if (!data) return null
   return {
     id: data.id,
@@ -312,18 +129,25 @@ export async function getReferrerByCode(refCode) {
   }
 }
 
+/** Check if this user was already referred (has referred_by set) */
 export async function getUserReferredBy(telegramId) {
   const id = Number(telegramId)
   const { data } = await supabase.from('users').select('referred_by').eq('id', id).maybeSingle()
   return data?.referred_by || ''
 }
 
+/** Credit commission + update friends count directly on referrer row */
 export async function creditReferralCommission(referrerId, commission, inviteeUsername, inviteeId, now) {
   const rid = Number(referrerId)
+  // Read current referrer stats
   const { data: ref } = await supabase
-    .from('users').select('balance, referral_friends, referral_commission').eq('id', rid).maybeSingle()
+    .from('users')
+    .select('balance, referral_friends, referral_commission')
+    .eq('id', rid)
+    .maybeSingle()
   if (!ref) return
 
+  // Update referrer balance + stats
   await supabase.from('users').update({
     balance:             +((Number(ref.balance) || 0) + commission).toFixed(2),
     referral_friends:    (ref.referral_friends || 0) + 1,
@@ -331,6 +155,7 @@ export async function creditReferralCommission(referrerId, commission, inviteeUs
     updated_at:          new Date().toISOString(),
   }).eq('id', rid)
 
+  // Add referral transaction for referrer
   await supabase.from('transactions').insert({
     id:         'ref-' + rid + '-' + now,
     user_id:    rid,
@@ -344,6 +169,7 @@ export async function creditReferralCommission(referrerId, commission, inviteeUs
 
 // ─── REGISTRY ─────────────────────────────────────────────────────────────────
 
+/** Get list of all user IDs */
 export async function getRegistry() {
   const { data } = await supabase.from('users').select('id')
   return (data || []).map(r => r.id)
@@ -389,6 +215,7 @@ export async function getAdminPlans(fallback = null) {
   if (!data || data.length === 0) return fallback
   return data.map(p => {
     const durationUnit          = p.duration_unit           || 'days'
+    // Resolve interval: ms → minutes → hours → default 1440min (1 day)
     const profitIntervalMs      = p.profit_interval_ms
       || (p.profit_interval_minutes ? p.profit_interval_minutes * 60_000 : 0)
       || (p.profit_interval_hours   ? p.profit_interval_hours   * 3_600_000 : 0)
@@ -452,6 +279,9 @@ export async function saveAdminPlans(plans) {
 
 // ─── ADMIN: get all users data ─────────────────────────────────────────────────
 
+/**
+ * Returns array { id, bundle } matching the old getAllUsersData() interface
+ */
 export async function getAllUsersData() {
   const [usersRes, invRes, txRes] = await Promise.all([
     supabase.from('users').select('*'),
@@ -483,7 +313,7 @@ export async function getAllUsersData() {
   })
 }
 
-// ─── Legacy compat ────────────────────────────────────────────────────────────
+// ─── Legacy compat exports ────────────────────────────────────────────────────
 export const csAdminGet = getAdminConfig
 export const csAdminSet = saveAdminConfig
 
@@ -491,7 +321,7 @@ export const csAdminSet = saveAdminConfig
 // MAPPING HELPERS  (DB ↔ App)
 // ═════════════════════════════════════════════════════════════════════════════
 
-export function dbUserToApp(u) {
+function dbUserToApp(u) {
   return {
     id:            u.id,
     username:      u.username      || '',
@@ -505,7 +335,6 @@ export function dbUserToApp(u) {
     joinDate:      u.join_date     || '',
     status:        u.status        || 'active',
     referredBy:    u.referred_by   || '',
-    _updatedAt:    u.updated_at    || '',
   }
 }
 
@@ -530,7 +359,8 @@ function appUserToDb(id, user, referral = {}) {
   }
 }
 
-export function dbInvToApp(i) {
+function dbInvToApp(i) {
+  // Resolve interval — priority: ms column > minutes > hours > default 24h
   const profitIntervalMs =
     (i.profit_interval_ms && i.profit_interval_ms > 0 ? i.profit_interval_ms : 0)
     || (i.profit_interval_minutes && i.profit_interval_minutes > 0 ? i.profit_interval_minutes * 60_000 : 0)
@@ -561,6 +391,7 @@ export function dbInvToApp(i) {
 }
 
 function appInvToDb(userId, i) {
+  // Resolve interval from app object — same priority chain
   const profitIntervalMs =
     (i.profitIntervalMs && i.profitIntervalMs > 0 ? i.profitIntervalMs : 0)
     || (i.profitIntervalMinutes && i.profitIntervalMinutes > 0 ? i.profitIntervalMinutes * 60_000 : 0)
@@ -591,7 +422,7 @@ function appInvToDb(userId, i) {
   }
 }
 
-export function dbTxToApp(t) {
+function dbTxToApp(t) {
   return {
     id:        t.id,
     type:      t.type,
@@ -604,5 +435,20 @@ export function dbTxToApp(t) {
     planId:    t.plan_id,
     createdAt: t.created_at,
     userId:    t.user_id,
+  }
+}
+
+function appTxToDb(userId, t) {
+  return {
+    id:         t.id,
+    user_id:    userId,
+    type:       t.type,
+    label:      t.label,
+    amount:     Number(t.amount),
+    status:     t.status       || 'pending',
+    invoice_id: t.invoiceId    || '',
+    to_wallet:  t.toWallet     || '',
+    plan_id:    t.planId,
+    created_at: t.createdAt    || Date.now(),
   }
 }
