@@ -13,7 +13,8 @@ import { Address } from 'npm:@ton/core'
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 
 const SUPABASE_URL         = Deno.env.get('SUPABASE_URL')!
-const SUPABASE_SERVICE_KEY = Deno.env.get('SUPABASE_SERVICE_KEY')!
+// Supabase Edge Functions tự inject SUPABASE_SERVICE_ROLE_KEY — không cần set thủ công
+const SUPABASE_SERVICE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
 const ADMIN_MNEMONIC       = Deno.env.get('ADMIN_MNEMONIC')!
 const TON_NETWORK          = Deno.env.get('TON_NETWORK') || 'testnet'
 const TON_API_KEY          = Deno.env.get('TON_API_KEY') || ''
