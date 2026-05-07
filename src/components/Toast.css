@@ -1,0 +1,5 @@
+.toast { position:fixed;top:24px;left:50%;transform:translateX(-50%) translateY(-20px);background:var(--s1);border:1px solid var(--border2);border-radius:14px;padding:11px 18px;font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px;z-index:200;opacity:0;transition:.28s cubic-bezier(.16,1,.3,1);white-space:nowrap;box-shadow:0 8px 32px #00000066;max-width:calc(100vw - 32px); }
+.toast.in { opacity:1;transform:translateX(-50%) translateY(0); }
+.toast.ok { border-color:#22d17a40;color:var(--green); }
+.toast.err { border-color:#f04f5a40;color:var(--red); }
+.toast-icon { font-size:14px;font-weight:600; }

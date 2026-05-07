@@ -1,0 +1,12 @@
+.bnav { position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:430px;background:var(--s1);border-top:1px solid var(--border2);display:flex;align-items:stretch;z-index:50;backdrop-filter:blur(12px);height:72px;padding:0 8px;safe-area-inset-bottom:env(safe-area-inset-bottom); }
+.ni { flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;cursor:pointer;position:relative;transition:.15s;padding:8px 0;border-radius:12px;margin:6px 4px; }
+.ni:active { background:var(--s2); }
+.ni-ico { color:var(--muted);transition:.18s;display:flex;align-items:center;justify-content:center; }
+.ni-lbl { font-size:10px;font-weight:600;color:var(--muted);transition:.18s; }
+.ni.on .ni-ico { color:var(--gold); }
+.ni.on .ni-lbl { color:var(--gold); }
+.ni.admin-tab .ni-ico { color:var(--red); }
+.ni.admin-tab .ni-lbl { color:var(--red); }
+.ni.on.admin-tab .ni-ico, .ni.on.admin-tab .ni-lbl { color:var(--red); }
+.ni-active-dot { position:absolute;bottom:0;left:50%;transform:translateX(-50%);width:4px;height:4px;border-radius:2px;background:var(--gold); }
+.ni.admin-tab .ni-active-dot { background:var(--red); }

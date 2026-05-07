@@ -1,0 +1,18 @@
+{
+  "name": "tonyield-withdrawal-worker",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Auto-withdrawal backend worker for TonYield",
+  "main": "withdrawal-worker.js",
+  "scripts": {
+    "start": "node withdrawal-worker.js",
+    "dev":   "node --watch withdrawal-worker.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.4",
+    "@ton/core":   "^0.59.0",
+    "@ton/crypto": "^3.3.0",
+    "@ton/ton":    "^15.1.0",
+    "dotenv":      "^16.4.5"
+  }
+}

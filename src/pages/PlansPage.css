@@ -1,0 +1,74 @@
+.weekend-bar { background:#f0b42912;border:1px solid #f0b42930;border-radius:12px;padding:11px 14px;font-size:12px;color:var(--gold);display:flex;align-items:center;gap:8px;margin-bottom:14px; }
+.pp-hero { margin-bottom:18px;padding-bottom:16px;border-bottom:1px solid var(--border); }
+.pph-label { font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);margin-bottom:6px; }
+.pph-title { font-family:var(--font-display);font-size:24px;font-weight:600;line-height:1.1;margin-bottom:6px; }
+.pph-title em { color:var(--gold);font-style:normal; }
+.pph-sub { font-size:12px;color:var(--muted);line-height:1.6; }
+
+.calc-box { background:var(--s1);border:1px solid var(--border2);border-radius:16px;padding:16px;margin-bottom:16px; }
+.calc-header { display:flex;align-items:center;gap:8px;margin-bottom:12px; }
+.calc-icon { font-size:16px; }
+.calc-title { font-family:var(--font-display);font-size:14px;font-weight:700; }
+.calc-input-row { position:relative;margin-bottom:14px; }
+.calc-input { width:100%;background:var(--s2);border:1px solid var(--border2);border-radius:12px;padding:12px 50px 12px 14px;font-family:var(--font-display);font-size:20px;font-weight:600;color:var(--text);outline:none; }
+.calc-input:focus { border-color:var(--gold); }
+.calc-unit { position:absolute;right:14px;top:50%;transform:translateY(-50%);font-size:12px;font-weight:700;color:var(--muted); }
+.calc-results { display:flex;align-items:center;gap:8px; }
+.cr-item { flex:1;text-align:center; }
+.cr-val { font-family:var(--font-display);font-size:17px;font-weight:600;color:var(--green); }
+.cr-label { font-size:10px;color:var(--muted);margin-top:2px; }
+.cr-divider { width:1px;height:30px;background:var(--border); }
+
+.plan-card { background:var(--s1);border:1px solid var(--border2);border-radius:18px;padding:18px;margin-bottom:12px;position:relative;overflow:hidden; }
+.plan-card.gold { border-top:2px solid var(--gold); }
+.plan-card.blue { border-top:2px solid var(--blue); }
+.plan-card.purple { border-top:2px solid var(--purple); }
+.pc-hot-ribbon { position:absolute;top:14px;right:-18px;background:var(--red);color:#fff;font-size:9px;font-weight:600;letter-spacing:.8px;padding:4px 24px;transform:rotate(35deg); }
+.pc-top { display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px; }
+.pc-badge { font-size:9px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;padding:3px 8px;border-radius:20px;display:inline-block;margin-bottom:6px; }
+.pc-badge.gold { background:#f0b42918;color:var(--gold); }
+.pc-badge.blue { background:#3b9eff18;color:var(--blue); }
+.pc-badge.purple { background:#8b5cf618;color:var(--purple); }
+.pc-name { font-family:var(--font-display);font-size:18px;font-weight:600;margin-bottom:3px; }
+.pc-range { font-size:11px;color:var(--muted); }
+.pc-rate-wrap { text-align:right; }
+.pc-rate { font-family:var(--font-display);font-size:26px;font-weight:600;line-height:1; }
+.pc-rate.gold { color:var(--gold); }
+.pc-rate.blue { color:var(--blue); }
+.pc-rate.purple { color:var(--purple); }
+.pc-per { font-size:10px;color:var(--muted);margin-top:2px; }
+.pc-divider { height:1px;background:var(--border);margin-bottom:12px; }
+.pc-features { display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:14px; }
+.pc-feat { display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted); }
+.dot { width:5px;height:5px;border-radius:50%;flex-shrink:0; }
+.dot.gold { background:var(--gold); }
+.dot.blue { background:var(--blue); }
+.dot.purple { background:var(--purple); }
+.pc-btn { width:100%;padding:13px;border:none;border-radius:12px;font-family:var(--font);font-size:14px;font-weight:700;cursor:pointer;transition:.15s;color:#fff; }
+.pc-btn:active { transform:scale(.97); }
+.pc-btn.gold { background:linear-gradient(135deg,var(--gold),var(--gold2));color:#080b12; }
+.pc-btn.blue { background:linear-gradient(135deg,var(--blue),var(--blue2)); }
+.pc-btn.purple { background:linear-gradient(135deg,var(--purple),var(--purple2)); }
+
+/* Calculator plan selector tabs */
+.calc-plan-tabs { display:flex;gap:6px;margin-bottom:12px; }
+.calc-plan-tab { flex:1;background:var(--s2);border:1px solid var(--border2);border-radius:10px;padding:8px 6px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:2px;transition:.15s; }
+.calc-plan-tab:active { transform:scale(.96); }
+.calc-plan-tab.gold.active { border-color:var(--gold);background:#f5a62312; }
+.calc-plan-tab.blue.active { border-color:var(--blue);background:#3d9be912; }
+.calc-plan-tab.purple.active { border-color:var(--purple);background:#9b6dff12; }
+.cpt-tier { font-size:9px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;color:var(--muted); }
+.cpt-rate { font-family:var(--font-display);font-size:14px;font-weight:600;color:var(--text); }
+.calc-plan-tab.gold.active .cpt-rate { color:var(--gold); }
+.calc-plan-tab.blue.active .cpt-rate { color:var(--blue); }
+.calc-plan-tab.purple.active .cpt-rate { color:var(--purple); }
+.calc-range-hint { font-size:11px;margin-bottom:10px;font-weight:600; }
+
+/* Active days on plan cards */
+.pc-days-row { display:flex;gap:5px;margin:10px 0 4px; }
+.pc-day-chip { font-size:10px;font-weight:700;padding:3px 7px;border-radius:6px;border:1px solid transparent; }
+.pc-day-chip.off { background:var(--s3);color:var(--muted);border-color:var(--border);opacity:.5; }
+.pc-day-chip.on.gold { background:#f5a62325;color:var(--gold);border-color:#f5a62350; }
+.pc-day-chip.on.blue { background:#3d9be925;color:var(--blue);border-color:#3d9be950; }
+.pc-day-chip.on.purple { background:#9b6dff25;color:var(--purple);border-color:#9b6dff50; }
+.pc-day-chip.today { outline:2px solid currentColor;outline-offset:1px; }

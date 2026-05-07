@@ -1,0 +1,21 @@
+{
+  "name": "tonyield-miniapp",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "@tonconnect/ui-react": "^2.0.6",
+    "@supabase/supabase-js": "^2.47.0",
+    "buffer": "^6.0.3"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^5.4.0"
+  }
+}
