@@ -445,7 +445,7 @@ export function useApp() {
       return true
     } catch(e) {
       const m = e?.message||''
-      if (/User rejects|CANCELLED|user rejected/i.test(m)) showToast('Transaction cancelled','err')
+      if (/User rejects|CANCELLED|user rejected|Transaction was not sent|not sent/i.test(m)) showToast('Transaction cancelled','err')
       else if (/invalid address/i.test(m)) showToast('Error: ADMIN_WALLET not configured.','err')
       else { console.error('[deposit]',e); showToast('Transaction failed. Try again.','err') }
       return false
@@ -471,7 +471,7 @@ export function useApp() {
       // ── Ghi withdraw request trực tiếp vào Supabase ──────────────────────
       // withdrawal-worker.js (backend) sẽ poll bảng transactions để gửi TON thật
       const now  = Date.now()
-      const txId = `tx-wd-${tid}-${now}`
+      const txId = `tx-wd-${tid}-${now}-${Math.random().toString(36).slice(2,7)}`
       const newBal = +(user.balance - amount).toFixed(6)
 
       // 1. Kiểm tra user không bị banned + balance từ DB
@@ -504,13 +504,15 @@ export function useApp() {
         status:     'pending',
         to_wallet:  destWallet,
         created_at: now,
+        updated_at: new Date().toISOString(),
       })
       if (txErr) {
+        console.error('[withdraw] insert txErr:', txErr)
         // Rollback balance nếu insert thất bại
         await supabase.from('users').update({
           balance: user.balance, updated_at: new Date().toISOString(),
         }).eq('id', Number(tid))
-        throw new Error('Failed to create transaction')
+        throw new Error(txErr.message || 'Failed to create transaction')
       }
 
       // 4. Cập nhật local state ngay lập tức
